@@ -2,7 +2,7 @@
 
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from sqlalchemy import text, select
@@ -23,6 +23,7 @@ with engine.connect() as conn:
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="RAG Learning API")
+document_statuses: dict[int, str] = {}
 
 
 class DocumentIn(BaseModel):
@@ -79,14 +80,13 @@ def list_documents() -> list[dict[str, object]]:
         db.close()
 
 
-@app.post("/documents/{doc_id}/process")
-def process_document(doc_id: int) -> dict[str, int]:
-    """Chunk and embed a stored document into the vector database."""
+def process_heavy_document(doc_id: int) -> None:
+    """Chunk and embed a stored document in a background task."""
     db = SessionLocal()
     try:
         doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
         if not doc:
-            raise HTTPException(status_code=404, detail="Document not found")
+            return
 
         chunks = chunk_text(doc.content)
 
@@ -102,9 +102,27 @@ def process_document(doc_id: int) -> dict[str, int]:
             )
 
         db.commit()
-        return {"document_id": doc.id, "chunks_created": len(chunks)}
+        document_statuses[doc_id] = "completed"
     finally:
         db.close()
+
+
+@app.post("/documents/{doc_id}/process")
+def trigger_process(doc_id: int, background_tasks: BackgroundTasks) -> dict[str, object]:
+    """Queue document processing and return before embedding work begins."""
+    document_statuses[doc_id] = "processing"
+    background_tasks.add_task(process_heavy_document, doc_id)
+    return {
+        "status": "processing",
+        "doc_id": doc_id,
+        "message": "Check status later",
+    }
+
+
+@app.get("/documents/{doc_id}/status")
+def get_document_status(doc_id: int) -> dict[str, str]:
+    """Return the current background processing status for a document."""
+    return {"status": document_statuses.get(doc_id, "processing")}
 
 
 @app.post("/search")

@@ -6,7 +6,7 @@ Production-style retrieval-augmented generation backend with vector search, stru
 
 ## What it does
 
-The API turns source documents into searchable knowledge and answers questions against that knowledge:
+The API turns source documents into searchable knowledge and answers questions against that knowledge. Document embedding runs through FastAPI background tasks, so large ingestion jobs leave the HTTP response cycle immediately:
 
 `ingest -> chunk -> embed -> store vectors -> semantic retrieve -> guarded LLM answer with citations`
 
@@ -32,6 +32,7 @@ flowchart LR
 - Explicit hallucination flag for unsupported answers.
 - Source document IDs injected server-side, never trusted from the LLM.
 - Deterministic `temperature=0` generation.
+- Background-task ingestion with a status endpoint for long-running embedding workloads.
 
 ## API reference
 
@@ -40,7 +41,8 @@ flowchart LR
 | GET | `/health` | Liveness check |
 | POST | `/documents` | Store a source document |
 | GET | `/documents` | List source documents |
-| POST | `/documents/{id}/process` | Chunk, embed, and persist a document |
+| POST | `/documents/{id}/process` | Queue chunking, embedding, and persistence |
+| GET | `/documents/{id}/status` | Check whether processing is `processing` or `completed` |
 | POST | `/search` | Retrieve nearest chunks |
 | POST | `/ask` | Retrieve context and generate a guarded answer |
 
@@ -115,6 +117,7 @@ pytest
 - **Similarity threshold:** prevents unrelated nearest neighbors from being presented as evidence.
 - **Server-side source IDs:** makes citations authoritative by deriving them from retrieved database rows instead of model output.
 - **Temperature 0:** favors repeatable answers and makes evaluation and debugging easier.
+- **Background ingestion:** moves chunking and embedding out of the request/response cycle to prevent long-document HTTP timeouts and keep the API responsive to concurrent requests.
 
 ## Roadmap
 

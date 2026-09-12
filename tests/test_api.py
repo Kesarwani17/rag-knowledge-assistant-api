@@ -5,6 +5,7 @@ import sys
 import types
 from pathlib import Path
 
+from fastapi import BackgroundTasks
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
@@ -83,3 +84,16 @@ def test_create_document_requires_fields():
     app_module = load_api_without_external_services()
     response = TestClient(app_module.app).post("/documents", json={})
     assert response.status_code == 422
+
+
+def test_process_trigger_queues_work_and_reports_processing():
+    """Processing should be queued and expose its initial status immediately."""
+    app_module = load_api_without_external_services()
+    background_tasks = BackgroundTasks()
+
+    response = app_module.trigger_process(42, background_tasks)
+
+    assert response["status"] == "processing"
+    assert response["doc_id"] == 42
+    assert background_tasks.tasks[0].func is app_module.process_heavy_document
+    assert app_module.get_document_status(42) == {"status": "processing"}
