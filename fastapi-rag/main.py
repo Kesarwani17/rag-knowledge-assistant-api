@@ -25,7 +25,6 @@ with engine.connect() as conn:
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="RAG Learning API")
-document_statuses: dict[int, str] = {}
 
 
 class DocumentIn(BaseModel):
@@ -85,6 +84,7 @@ def list_documents() -> list[dict[str, object]]:
 def process_heavy_document(doc_id: int) -> None:
     """Chunk and embed a stored document in a background task."""
     db = SessionLocal()
+    doc = None
     try:
         doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
         if not doc:
@@ -104,7 +104,16 @@ def process_heavy_document(doc_id: int) -> None:
             )
 
         db.commit()
-        document_statuses[doc_id] = "completed"
+        doc.status = "completed"
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        if doc is None:
+            doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+        if doc:
+            doc.status = "failed"
+            db.commit()
+        print(f"Error processing doc {doc_id}: {exc}")
     finally:
         db.close()
 
@@ -112,19 +121,35 @@ def process_heavy_document(doc_id: int) -> None:
 @app.post("/documents/{doc_id}/process")
 def trigger_process(doc_id: int, background_tasks: BackgroundTasks) -> dict[str, object]:
     """Queue document processing and return before embedding work begins."""
-    document_statuses[doc_id] = "processing"
-    background_tasks.add_task(process_heavy_document, doc_id)
-    return {
-        "status": "processing",
-        "doc_id": doc_id,
-        "message": "Check status later",
-    }
+    db = SessionLocal()
+    try:
+        doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        doc.status = "processing"
+        db.commit()
+        background_tasks.add_task(process_heavy_document, doc_id)
+        return {
+            "status": "processing",
+            "doc_id": doc_id,
+            "message": "Embedding started. Check /documents/{doc_id}/status for updates.",
+        }
+    finally:
+        db.close()
 
 
 @app.get("/documents/{doc_id}/status")
 def get_document_status(doc_id: int) -> dict[str, str]:
     """Return the current background processing status for a document."""
-    return {"status": document_statuses.get(doc_id, "processing")}
+    db = SessionLocal()
+    try:
+        doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+        return {"status": doc.status}
+    finally:
+        db.close()
 
 
 @app.post("/search")

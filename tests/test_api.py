@@ -106,9 +106,50 @@ def test_process_trigger_queues_work_and_reports_processing():
     app_module = load_api_without_external_services()
     background_tasks = BackgroundTasks()
 
+    class FakeColumn:
+        """Column stand-in that supports the filter expression used by the API."""
+
+        def __eq__(self, other):
+            return True
+
+    class FakeDocument:
+        """Database document stand-in for status persistence assertions."""
+
+        id = FakeColumn()
+
+        def __init__(self):
+            self.status = "pending"
+
+    document = FakeDocument()
+
+    class FakeQuery:
+        """Minimal SQLAlchemy query chain used by the status routes."""
+
+        def filter(self, expression):
+            return self
+
+        def first(self):
+            return document
+
+    class FakeSession:
+        """Minimal session that records commits and supports cleanup."""
+
+        def query(self, model):
+            return FakeQuery()
+
+        def commit(self):
+            return None
+
+        def close(self):
+            return None
+
+    app_module.models.Document = FakeDocument
+    app_module.SessionLocal = FakeSession
+
     response = app_module.trigger_process(42, background_tasks)
 
     assert response["status"] == "processing"
     assert response["doc_id"] == 42
     assert background_tasks.tasks[0].func is app_module.process_heavy_document
+    assert document.status == "processing"
     assert app_module.get_document_status(42) == {"status": "processing"}

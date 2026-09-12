@@ -45,7 +45,7 @@ flowchart LR
 | POST | `/documents` | Store a source document |
 | GET | `/documents` | List source documents |
 | POST | `/documents/{id}/process` | Queue chunking, embedding, and persistence |
-| GET | `/documents/{id}/status` | Check whether processing is `processing` or `completed` |
+| GET | `/documents/{id}/status` | Check whether processing is `pending`, `processing`, `completed`, or `failed` |
 | POST | `/search` | Retrieve hybrid semantic and keyword matches |
 | POST | `/ask` | Retrieve context, use the semantic cache, and generate a guarded answer |
 
@@ -124,6 +124,7 @@ pytest
 - **Server-side source IDs:** makes citations authoritative by deriving them from retrieved database rows instead of model output.
 - **Temperature 0:** favors repeatable answers and makes evaluation and debugging easier.
 - **Background ingestion:** moves chunking and embedding out of the request/response cycle to prevent long-document HTTP timeouts and keep the API responsive to concurrent requests.
+- **Persistent job status:** stores ingestion state on the document row so status remains consistent across workers and process restarts; failures are recorded as `failed`.
 - **Hybrid search:** combines dense embeddings for semantic meaning with sparse PostgreSQL full-text matching for exact entities such as `ERR-4042`.
 - **Reranking:** expands `/ask` retrieval to 15 candidates, then uses a local CrossEncoder to select the 3 most relevant context chunks for generation.
 - **Semantic caching:** stores query embeddings and validated answers in Redis for one hour; a cosine similarity above `0.95` returns the cached answer without calling Groq.

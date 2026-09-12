@@ -18,6 +18,7 @@ class Document(Base):
     content = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     tenant_id = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False, default="pending", server_default="pending")
 
 
 class DocumentChunk(Base):
