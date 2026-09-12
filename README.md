@@ -28,6 +28,7 @@ flowchart LR
 - Free local embeddings with `all-MiniLM-L6-v2` (384 dimensions; no embedding API cost).
 - Hybrid retrieval combining cosine-similarity search in pgvector with PostgreSQL full-text keyword matching.
 - Exact keyword matching for entities such as error codes and SKUs alongside semantic retrieval.
+- Local CrossEncoder reranking of 15 retrieved candidates before the LLM sees the top 3.
 - Similarity-threshold filtering to reject weak context.
 - Pydantic-validated JSON responses.
 - Explicit hallucination flag for unsupported answers.
@@ -120,6 +121,7 @@ pytest
 - **Temperature 0:** favors repeatable answers and makes evaluation and debugging easier.
 - **Background ingestion:** moves chunking and embedding out of the request/response cycle to prevent long-document HTTP timeouts and keep the API responsive to concurrent requests.
 - **Hybrid search:** combines dense embeddings for semantic meaning with sparse PostgreSQL full-text matching for exact entities such as `ERR-4042`.
+- **Reranking:** expands `/ask` retrieval to 15 candidates, then uses a local CrossEncoder to select the 3 most relevant context chunks for generation.
 
 ## Roadmap
 

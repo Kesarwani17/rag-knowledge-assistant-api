@@ -49,16 +49,19 @@ def load_api_without_external_services():
     fake_llm = types.ModuleType("llm")
     fake_llm.RAGResponse = FakeRAGResponse
     fake_llm.generate_answer = lambda query, context_chunks: FakeRAGResponse()
+    fake_reranker = types.ModuleType("reranker")
+    fake_reranker.rerank_chunks = lambda query, chunks: chunks
 
     previous_modules = {
         name: sys.modules.get(name)
-        for name in ("database", "models", "embeddings", "llm", "main")
+        for name in ("database", "models", "embeddings", "llm", "reranker", "main")
     }
     sys.modules["database"] = fake_database
     sys.modules["models"] = fake_models
     sys.modules["embeddings"] = types.ModuleType("embeddings")
     sys.modules["embeddings"].get_embedding = lambda text: []
     sys.modules["llm"] = fake_llm
+    sys.modules["reranker"] = fake_reranker
     sys.modules.pop("main", None)
 
     try:

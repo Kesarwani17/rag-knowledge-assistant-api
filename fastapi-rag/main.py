@@ -12,6 +12,7 @@ from database import Base, SessionLocal, engine
 import models
 from chunking import chunk_text
 from embeddings import get_embedding
+from reranker import rerank_chunks
 
 load_dotenv()
 
@@ -187,10 +188,10 @@ class AskQuery(BaseModel):
 
 @app.post("/ask", response_model=RAGResponse)
 def ask_question(req: AskQuery) -> RAGResponse:
-    """Retrieve relevant chunks and generate a grounded structured answer."""
+    """Retrieve, rerank, and generate a grounded answer from relevant chunks."""
     db = SessionLocal()
     try:
-        # 1. RETRIEVAL: Get the top 3 most relevant chunks
+        # 1. RETRIEVAL: Get a broad candidate set for local reranking
         query_embedding = get_embedding(req.query)
         stmt = (
             select(
@@ -199,7 +200,7 @@ def ask_question(req: AskQuery) -> RAGResponse:
             )
             .where(models.DocumentChunk.tenant_id == os.getenv("MOCK_TENANT_ID"))
             .order_by("distance")
-            .limit(3)
+            .limit(15)
         )
         results = db.execute(stmt).all()
 
@@ -222,7 +223,10 @@ def ask_question(req: AskQuery) -> RAGResponse:
                 is_hallucination=True,
                 source_document_ids=[]
             )
-        # 2. GENERATION: Send chunks to Groq LLM with Pydantic Guardrails
+        # 2. RERANKING: Let the local CrossEncoder select the best context.
+        chunks = rerank_chunks(req.query, chunks)[:3]
+
+        # 3. GENERATION: Send only the top 3 chunks to Groq with guardrails
         llm_response = generate_answer(req.query, chunks)
 
         # --- SENIOR FIX: Force the correct IDs from the database ---
