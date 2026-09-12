@@ -13,6 +13,7 @@ import models
 from chunking import chunk_text
 from embeddings import get_embedding
 from reranker import rerank_chunks
+from semantic_cache import cache_response, get_cached_response
 
 load_dotenv()
 
@@ -193,6 +194,10 @@ def ask_question(req: AskQuery) -> RAGResponse:
     try:
         # 1. RETRIEVAL: Get a broad candidate set for local reranking
         query_embedding = get_embedding(req.query)
+        cached_response = get_cached_response(query_embedding)
+        if cached_response:
+            return cached_response
+
         stmt = (
             select(
                 models.DocumentChunk,
@@ -232,6 +237,7 @@ def ask_question(req: AskQuery) -> RAGResponse:
         # --- SENIOR FIX: Force the correct IDs from the database ---
         # Don't rely on the LLM to remember IDs. We inject the exact ones we retrieved.
         llm_response.source_document_ids = list(set(c["document_id"] for c in chunks))
+        cache_response(query_embedding, llm_response)
 
         return llm_response
 

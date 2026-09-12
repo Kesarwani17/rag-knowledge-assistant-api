@@ -51,10 +51,21 @@ def load_api_without_external_services():
     fake_llm.generate_answer = lambda query, context_chunks: FakeRAGResponse()
     fake_reranker = types.ModuleType("reranker")
     fake_reranker.rerank_chunks = lambda query, chunks: chunks
+    fake_semantic_cache = types.ModuleType("semantic_cache")
+    fake_semantic_cache.cache_response = lambda query_vector, response: None
+    fake_semantic_cache.get_cached_response = lambda query_vector: None
 
     previous_modules = {
         name: sys.modules.get(name)
-        for name in ("database", "models", "embeddings", "llm", "reranker", "main")
+        for name in (
+            "database",
+            "models",
+            "embeddings",
+            "llm",
+            "reranker",
+            "semantic_cache",
+            "main",
+        )
     }
     sys.modules["database"] = fake_database
     sys.modules["models"] = fake_models
@@ -62,6 +73,7 @@ def load_api_without_external_services():
     sys.modules["embeddings"].get_embedding = lambda text: []
     sys.modules["llm"] = fake_llm
     sys.modules["reranker"] = fake_reranker
+    sys.modules["semantic_cache"] = fake_semantic_cache
     sys.modules.pop("main", None)
 
     try:

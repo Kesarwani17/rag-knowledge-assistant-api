@@ -2,7 +2,7 @@
 
 Production-style retrieval-augmented generation backend with vector search, structured outputs, and hallucination guardrails.
 
-**Stack:** FastAPI · PostgreSQL + pgvector · sentence-transformers · Groq (OpenAI-compatible) · Pydantic v2 · Docker
+**Stack:** FastAPI · PostgreSQL + pgvector · Redis · sentence-transformers · Groq (OpenAI-compatible) · Pydantic v2 · Docker
 
 ## What it does
 
@@ -35,6 +35,7 @@ flowchart LR
 - Source document IDs injected server-side, never trusted from the LLM.
 - Deterministic `temperature=0` generation.
 - Background-task ingestion with a status endpoint for long-running embedding workloads.
+- Redis semantic caching with cosine similarity to bypass duplicate LLM calls.
 
 ## API reference
 
@@ -46,7 +47,7 @@ flowchart LR
 | POST | `/documents/{id}/process` | Queue chunking, embedding, and persistence |
 | GET | `/documents/{id}/status` | Check whether processing is `processing` or `completed` |
 | POST | `/search` | Retrieve hybrid semantic and keyword matches |
-| POST | `/ask` | Retrieve context and generate a guarded answer |
+| POST | `/ask` | Retrieve context, use the semantic cache, and generate a guarded answer |
 
 Example `/ask` request:
 
@@ -84,6 +85,7 @@ uvicorn main:app --reload
 ```
 
 Add `GROQ_API_KEY` and `DATABASE_URL` to `fastapi-rag\.env`, then open <http://127.0.0.1:8000/docs>.
+Redis runs locally at `redis://localhost:6379/0` through Docker Compose.
 
 Run the test suite from the repository root:
 
@@ -103,6 +105,8 @@ pytest
 |   |-- chunking.py     # Overlapping text chunking
 |   |-- embeddings.py   # Local sentence-transformer embeddings
 |   |-- llm.py          # Groq structured generation and guardrails
+|   |-- reranker.py     # Local CrossEncoder relevance reranking
+|   |-- semantic_cache.py # Redis vector-similarity response cache
 |   `-- .env            # Local secrets; ignored by Git
 |-- tests/              # DB- and API-key-free automated tests
 |-- docker-compose.yml  # Persistent pgvector service
@@ -122,6 +126,7 @@ pytest
 - **Background ingestion:** moves chunking and embedding out of the request/response cycle to prevent long-document HTTP timeouts and keep the API responsive to concurrent requests.
 - **Hybrid search:** combines dense embeddings for semantic meaning with sparse PostgreSQL full-text matching for exact entities such as `ERR-4042`.
 - **Reranking:** expands `/ask` retrieval to 15 candidates, then uses a local CrossEncoder to select the 3 most relevant context chunks for generation.
+- **Semantic caching:** stores query embeddings and validated answers in Redis for one hour; a cosine similarity above `0.95` returns the cached answer without calling Groq.
 
 ## Roadmap
 
