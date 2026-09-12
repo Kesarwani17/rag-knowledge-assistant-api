@@ -27,6 +27,11 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(title="RAG Learning API")
 
 
+def get_current_tenant_id() -> str:
+    """Return the configured tenant identifier for the current deployment."""
+    return os.getenv("MOCK_TENANT_ID", "default")
+
+
 class DocumentIn(BaseModel):
     """Request body for storing a source document."""
 
@@ -159,6 +164,7 @@ def search_documents(req: SearchQuery) -> list[dict[str, object]]:
     """Combine dense vector and sparse keyword retrieval for a query."""
     db = SessionLocal()
     try:
+        tenant_id = get_current_tenant_id()
         # Dense retrieval captures semantic meaning.
         query_embedding = get_embedding(req.query)
         vector_stmt = (
@@ -166,6 +172,7 @@ def search_documents(req: SearchQuery) -> list[dict[str, object]]:
                 models.DocumentChunk,
                 models.DocumentChunk.embedding.cosine_distance(query_embedding).label("distance")
             )
+            .where(models.DocumentChunk.tenant_id == tenant_id)
             .order_by("distance")
             .limit(req.top_k)
         )
@@ -180,7 +187,10 @@ def search_documents(req: SearchQuery) -> list[dict[str, object]]:
                     func.plainto_tsquery("english", req.query),
                 ).label("keyword_score"),
             )
-            .where(models.DocumentChunk.search_vector.match(req.query))
+            .where(
+                models.DocumentChunk.tenant_id == tenant_id,
+                models.DocumentChunk.search_vector.match(req.query),
+            )
             .order_by(desc("keyword_score"))
             .limit(req.top_k)
         )
@@ -220,7 +230,7 @@ def ask_question(req: AskQuery) -> RAGResponse:
     try:
         # 1. RETRIEVAL: Get a broad candidate set for local reranking
         query_embedding = get_embedding(req.query)
-        tenant_id = os.getenv("MOCK_TENANT_ID", "default")
+        tenant_id = get_current_tenant_id()
         cached_response = get_cached_response(tenant_id, query_embedding)
         if cached_response:
             return cached_response
@@ -230,7 +240,7 @@ def ask_question(req: AskQuery) -> RAGResponse:
                 models.DocumentChunk,
                 models.DocumentChunk.embedding.cosine_distance(query_embedding).label("distance")
             )
-            .where(models.DocumentChunk.tenant_id == os.getenv("MOCK_TENANT_ID"))
+            .where(models.DocumentChunk.tenant_id == tenant_id)
             .order_by("distance")
             .limit(15)
         )
