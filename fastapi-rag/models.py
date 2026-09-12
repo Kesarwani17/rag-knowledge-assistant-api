@@ -16,6 +16,7 @@ class Document(Base):
     title = Column(String(255), nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    tenant_id = Column(String, nullable=False, index=True)
 
 
 class DocumentChunk(Base):
@@ -28,3 +29,4 @@ class DocumentChunk(Base):
     chunk_index = Column(Integer, nullable=False)
     chunk_text = Column(Text, nullable=False)
     embedding = Column(Vector(EMBEDDING_DIM))
+    tenant_id = Column(String, nullable=False, index=True)

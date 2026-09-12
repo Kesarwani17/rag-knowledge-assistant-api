@@ -1,11 +1,13 @@
 """FastAPI application exposing document ingestion, retrieval, and RAG answers."""
 
+import os
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from sqlalchemy import text, select
-from llm import generate_answer, RAGResponse
 
+from llm import generate_answer, RAGResponse
 from database import Base, SessionLocal, engine
 import models
 from chunking import chunk_text
@@ -46,8 +48,18 @@ def health() -> dict[str, str]:
 def create_document(doc: DocumentIn) -> dict[str, object]:
     """Store a source document and return its generated identifier."""
     db = SessionLocal()
+    
+    useMockTenant = os.getenv("USE_MOCK_TENANT")
+    if useMockTenant is True:
+        print("Using mock tenant ID for document creation.")
+        tenant_id = os.getenv("MOCK_TENANT_ID")
+        if not tenant_id:
+            raise RuntimeError("MOCK_TENANT_ID must be set")
+    else:
+        tenant_id = doc.tenant_id
+
     try:
-        new_doc = models.Document(title=doc.title, content=doc.content)
+        new_doc = models.Document(title=doc.title, content=doc.content, tenant_id=tenant_id)
         db.add(new_doc)
         db.commit()
         db.refresh(new_doc)
@@ -144,6 +156,7 @@ def ask_question(req: AskQuery) -> RAGResponse:
                 models.DocumentChunk,
                 models.DocumentChunk.embedding.cosine_distance(query_embedding).label("distance")
             )
+            .where(models.DocumentChunk.tenant_id == os.getenv("MOCK_TENANT_ID"))
             .order_by("distance")
             .limit(3)
         )
