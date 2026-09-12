@@ -1,6 +1,7 @@
 """Offline tests for Redis semantic cache matching and serialization."""
 
 import sys
+from fnmatch import fnmatch
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parents[1] / "fastapi-rag"
@@ -17,7 +18,7 @@ class FakeRedis:
         self.values = {}
 
     def scan_iter(self, match):
-        return iter(self.values)
+        return (key for key in self.values if fnmatch(key, match))
 
     def get(self, key):
         return self.values.get(key)
@@ -36,9 +37,9 @@ def test_cache_returns_response_above_similarity_threshold(monkeypatch):
         source_document_ids=[7],
     )
 
-    semantic_cache.cache_response([1.0, 0.0], response)
+    semantic_cache.cache_response("tenant-a", [1.0, 0.0], response)
 
-    cached = semantic_cache.get_cached_response([0.999, 0.001])
+    cached = semantic_cache.get_cached_response("tenant-a", [0.999, 0.001])
     assert cached == response
 
 
@@ -48,6 +49,17 @@ def test_cache_misses_below_similarity_threshold(monkeypatch):
     monkeypatch.setattr(semantic_cache, "redis_client", fake_redis)
     response = RAGResponse(answer="cached", is_hallucination=False)
 
-    semantic_cache.cache_response([1.0, 0.0], response)
+    semantic_cache.cache_response("tenant-a", [1.0, 0.0], response)
 
-    assert semantic_cache.get_cached_response([0.0, 1.0]) is None
+    assert semantic_cache.get_cached_response("tenant-a", [0.0, 1.0]) is None
+
+
+def test_cache_does_not_cross_tenants(monkeypatch):
+    """A matching vector in another tenant must not return a cached answer."""
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(semantic_cache, "redis_client", fake_redis)
+    response = RAGResponse(answer="tenant-a", is_hallucination=False)
+
+    semantic_cache.cache_response("tenant-a", [1.0, 0.0], response)
+
+    assert semantic_cache.get_cached_response("tenant-b", [1.0, 0.0]) is None

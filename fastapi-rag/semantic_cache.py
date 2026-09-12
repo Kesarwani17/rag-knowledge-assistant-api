@@ -29,10 +29,11 @@ def cosine_similarity(first: list[float], second: list[float]) -> float:
     return dot_product / (first_norm * second_norm)
 
 
-def get_cached_response(query_vector: list[float]) -> RAGResponse | None:
+def get_cached_response(tenant_id: str, query_vector: list[float]) -> RAGResponse | None:
     """Return the closest cached response when similarity exceeds the threshold."""
     try:
-        for key in redis_client.scan_iter(match=f"{CACHE_PREFIX}*"):
+        cache_namespace = f"{CACHE_PREFIX}{tenant_id}:"
+        for key in redis_client.scan_iter(match=f"{cache_namespace}*"):
             cached = redis_client.get(key)
             if not cached:
                 continue
@@ -45,7 +46,7 @@ def get_cached_response(query_vector: list[float]) -> RAGResponse | None:
     return None
 
 
-def cache_response(query_vector: list[float], response: RAGResponse) -> None:
+def cache_response(tenant_id: str, query_vector: list[float], response: RAGResponse) -> None:
     """Store a generated response and its query vector with a bounded TTL."""
     payload = {
         "query_vector": query_vector,
@@ -53,7 +54,7 @@ def cache_response(query_vector: list[float], response: RAGResponse) -> None:
     }
     try:
         redis_client.set(
-            f"{CACHE_PREFIX}{uuid4().hex}",
+            f"{CACHE_PREFIX}{tenant_id}:{uuid4().hex}",
             json.dumps(payload),
             ex=CACHE_TTL_SECONDS,
         )

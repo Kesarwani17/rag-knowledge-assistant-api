@@ -52,8 +52,8 @@ def load_api_without_external_services():
     fake_reranker = types.ModuleType("reranker")
     fake_reranker.rerank_chunks = lambda query, chunks: chunks
     fake_semantic_cache = types.ModuleType("semantic_cache")
-    fake_semantic_cache.cache_response = lambda query_vector, response: None
-    fake_semantic_cache.get_cached_response = lambda query_vector: None
+    fake_semantic_cache.cache_response = lambda tenant_id, query_vector, response: None
+    fake_semantic_cache.get_cached_response = lambda tenant_id, query_vector: None
 
     previous_modules = {
         name: sys.modules.get(name)

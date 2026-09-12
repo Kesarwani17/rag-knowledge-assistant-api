@@ -52,7 +52,7 @@ def create_document(doc: DocumentIn) -> dict[str, object]:
     db = SessionLocal()
     
     useMockTenant = os.getenv("USE_MOCK_TENANT")
-    if useMockTenant is True:
+    if os.getenv("USE_MOCK_TENANT", "false").lower() == "true":
         print("Using mock tenant ID for document creation.")
         tenant_id = os.getenv("MOCK_TENANT_ID")
         if not tenant_id:
@@ -100,6 +100,8 @@ def process_heavy_document(doc_id: int) -> None:
                     chunk_index=index,
                     chunk_text=chunk,
                     embedding=embedding,
+                    tenant_id=doc.tenant_id,
+                    search_vector=func.to_tsvector("english", chunk),
                 )
             )
 
@@ -170,16 +172,15 @@ def search_documents(req: SearchQuery) -> list[dict[str, object]]:
         vector_results = db.execute(vector_stmt).all()
 
         # Sparse retrieval preserves exact entities such as error codes and SKUs.
-        keyword_vector = func.to_tsvector("english", models.DocumentChunk.chunk_text)
         keyword_stmt = (
             select(
                 models.DocumentChunk,
                 func.ts_rank(
-                    keyword_vector,
+                    models.DocumentChunk.search_vector,
                     func.plainto_tsquery("english", req.query),
                 ).label("keyword_score"),
             )
-            .where(keyword_vector.match(req.query))
+            .where(models.DocumentChunk.search_vector.match(req.query))
             .order_by(desc("keyword_score"))
             .limit(req.top_k)
         )
@@ -219,7 +220,8 @@ def ask_question(req: AskQuery) -> RAGResponse:
     try:
         # 1. RETRIEVAL: Get a broad candidate set for local reranking
         query_embedding = get_embedding(req.query)
-        cached_response = get_cached_response(query_embedding)
+        tenant_id = os.getenv("MOCK_TENANT_ID", "default")
+        cached_response = get_cached_response(tenant_id, query_embedding)
         if cached_response:
             return cached_response
 
@@ -262,7 +264,7 @@ def ask_question(req: AskQuery) -> RAGResponse:
         # --- SENIOR FIX: Force the correct IDs from the database ---
         # Don't rely on the LLM to remember IDs. We inject the exact ones we retrieved.
         llm_response.source_document_ids = list(set(c["document_id"] for c in chunks))
-        cache_response(query_embedding, llm_response)
+        cache_response(tenant_id, query_embedding, llm_response)
 
         return llm_response
 
