@@ -1,6 +1,7 @@
 """SQLAlchemy models for source documents and their vectorized chunks."""
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, func
+from sqlalchemy import Column, DateTime, Integer, String, Text, func
+from sqlalchemy.dialects.postgresql import TSVECTOR
 from pgvector.sqlalchemy import Vector
 from database import Base
 
@@ -30,3 +31,4 @@ class DocumentChunk(Base):
     chunk_text = Column(Text, nullable=False)
     embedding = Column(Vector(EMBEDDING_DIM))
     tenant_id = Column(String, nullable=False, index=True)
+    search_vector = Column(TSVECTOR)

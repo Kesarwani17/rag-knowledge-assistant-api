@@ -5,7 +5,7 @@ import os
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from sqlalchemy import text, select
+from sqlalchemy import desc, func, select, text
 
 from llm import generate_answer, RAGResponse
 from database import Base, SessionLocal, engine
@@ -127,14 +127,12 @@ def get_document_status(doc_id: int) -> dict[str, str]:
 
 @app.post("/search")
 def search_documents(req: SearchQuery) -> list[dict[str, object]]:
-    """Return the closest document chunks for a semantic query."""
+    """Combine dense vector and sparse keyword retrieval for a query."""
     db = SessionLocal()
     try:
-        # 1. Turn the user's question into a vector
+        # Dense retrieval captures semantic meaning.
         query_embedding = get_embedding(req.query)
-
-        # 2. Use the built-in pgvector column method for cosine distance
-        stmt = (
+        vector_stmt = (
             select(
                 models.DocumentChunk,
                 models.DocumentChunk.embedding.cosine_distance(query_embedding).label("distance")
@@ -142,18 +140,43 @@ def search_documents(req: SearchQuery) -> list[dict[str, object]]:
             .order_by("distance")
             .limit(req.top_k)
         )
+        vector_results = db.execute(vector_stmt).all()
 
-        results = db.execute(stmt).all()
+        # Sparse retrieval preserves exact entities such as error codes and SKUs.
+        keyword_vector = func.to_tsvector("english", models.DocumentChunk.chunk_text)
+        keyword_stmt = (
+            select(
+                models.DocumentChunk,
+                func.ts_rank(
+                    keyword_vector,
+                    func.plainto_tsquery("english", req.query),
+                ).label("keyword_score"),
+            )
+            .where(keyword_vector.match(req.query))
+            .order_by(desc("keyword_score"))
+            .limit(req.top_k)
+        )
+        keyword_results = db.execute(keyword_stmt).all()
 
-        # 3. Return the matched text chunks
-        return [
-            {
+        combined_results: dict[int, dict[str, object]] = {}
+        for chunk, distance in vector_results:
+            combined_results[chunk.id] = {
                 "text": chunk.chunk_text,
                 "document_id": chunk.document_id,
-                "similarity_score": round(1.0 - float(dist), 4)
+                "similarity_score": round(1.0 - float(distance), 4),
             }
-            for chunk, dist in results
-        ]
+
+        for chunk, keyword_score in keyword_results:
+            combined_results.setdefault(
+                chunk.id,
+                {
+                    "text": chunk.chunk_text,
+                    "document_id": chunk.document_id,
+                    "similarity_score": round(float(keyword_score), 4),
+                },
+            )
+
+        return list(combined_results.values())[: req.top_k]
     finally:
         db.close()
 

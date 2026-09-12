@@ -26,7 +26,8 @@ flowchart LR
 ## Features
 
 - Free local embeddings with `all-MiniLM-L6-v2` (384 dimensions; no embedding API cost).
-- Cosine-similarity retrieval in pgvector.
+- Hybrid retrieval combining cosine-similarity search in pgvector with PostgreSQL full-text keyword matching.
+- Exact keyword matching for entities such as error codes and SKUs alongside semantic retrieval.
 - Similarity-threshold filtering to reject weak context.
 - Pydantic-validated JSON responses.
 - Explicit hallucination flag for unsupported answers.
@@ -43,7 +44,7 @@ flowchart LR
 | GET | `/documents` | List source documents |
 | POST | `/documents/{id}/process` | Queue chunking, embedding, and persistence |
 | GET | `/documents/{id}/status` | Check whether processing is `processing` or `completed` |
-| POST | `/search` | Retrieve nearest chunks |
+| POST | `/search` | Retrieve hybrid semantic and keyword matches |
 | POST | `/ask` | Retrieve context and generate a guarded answer |
 
 Example `/ask` request:
@@ -118,6 +119,7 @@ pytest
 - **Server-side source IDs:** makes citations authoritative by deriving them from retrieved database rows instead of model output.
 - **Temperature 0:** favors repeatable answers and makes evaluation and debugging easier.
 - **Background ingestion:** moves chunking and embedding out of the request/response cycle to prevent long-document HTTP timeouts and keep the API responsive to concurrent requests.
+- **Hybrid search:** combines dense embeddings for semantic meaning with sparse PostgreSQL full-text matching for exact entities such as `ERR-4042`.
 
 ## Roadmap
 
