@@ -2,25 +2,46 @@
 
 Production-style retrieval-augmented generation backend with vector search, structured outputs, and hallucination guardrails.
 
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.141.1-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 **Stack:** FastAPI · PostgreSQL + pgvector · Redis · sentence-transformers · Groq (OpenAI-compatible) · Pydantic v2 · Docker
 
 ## What it does
 
-The API turns source documents into searchable knowledge and answers questions against that knowledge. Document embedding runs through FastAPI background tasks, so large ingestion jobs leave the HTTP response cycle immediately:
+The API turns tenant-scoped source documents into searchable knowledge and answers questions against that knowledge. Document embedding runs through FastAPI background tasks, so large ingestion jobs leave the HTTP response cycle immediately:
 
-`ingest -> chunk -> embed -> store vectors -> semantic retrieve -> guarded LLM answer with citations`
+`ingest -> chunk -> embed + full-text vector -> store -> hybrid retrieve -> rerank -> semantic cache or guarded LLM answer`
+
+The design keeps expensive work explicit: ingestion is asynchronous, retrieval combines dense and sparse signals, reranking narrows context before generation, and Redis can bypass repeated LLM inference.
 
 ```mermaid
-flowchart LR
-    A[Document API] --> B[Chunk with overlap]
-    B --> C[Local sentence-transformer]
-    C --> D[(PostgreSQL + pgvector)]
-    Q[Question API] --> E[Embed query]
-    E --> F[Cosine similarity search]
-    D --> F
-    F --> G[Similarity threshold]
-    G --> H[Groq structured output]
-    H --> I[Pydantic response + server-side source IDs]
+flowchart TB
+  subgraph INGEST[Document ingestion]
+    A[POST /documents] --> B[Background task]
+    B --> C[Chunk with overlap]
+    C --> D[Local sentence-transformer]
+    C --> E[PostgreSQL TSVECTOR]
+    D --> F[(PostgreSQL + pgvector)]
+    E --> F
+    F --> G[Status: completed or failed]
+  end
+
+  subgraph ANSWER[Question answering]
+    H[POST /ask] --> I[Embed query]
+    I --> J[Hybrid retrieval]
+    F --> J
+    J --> K[Cosine + GIN keyword search]
+    K --> L[Similarity threshold]
+    L --> M[CrossEncoder reranker]
+    M --> N[(Redis semantic cache)]
+    N -- cache hit --> O[Validated cached response]
+    N -- cache miss --> P[Groq structured output]
+    P --> Q[Server-side source IDs]
+    O --> Q
+  end
 ```
 
 ## Features
@@ -36,6 +57,9 @@ flowchart LR
 - Deterministic `temperature=0` generation.
 - Background-task ingestion with a status endpoint for long-running embedding workloads.
 - Redis semantic caching with cosine similarity to bypass duplicate LLM calls.
+- Tenant-scoped retrieval and cache isolation through `tenant_id`.
+- Persistent ingestion lifecycle states: `pending`, `processing`, `completed`, and `failed`.
+- GIN-indexed PostgreSQL `TSVECTOR` search column populated when chunks are ingested.
 
 ## API reference
 
@@ -67,6 +91,26 @@ Example response:
 }
 ```
 
+Example `/documents` request:
+
+```json
+{
+  "title": "Return Policy",
+  "content": "Returns are accepted within 30 days."
+}
+```
+
+In the current demo configuration, document tenancy is selected from `MOCK_TENANT_ID`; production authentication should replace this with the tenant from the request identity.
+
+Example `/search` request:
+
+```json
+{
+  "query": "ERR-4042",
+  "top_k": 3
+}
+```
+
 ## Quickstart
 
 Prerequisites: Python 3.11+ and Docker Desktop.
@@ -84,8 +128,8 @@ Set-Location fastapi-rag
 uvicorn main:app --reload
 ```
 
-Add `GROQ_API_KEY` and `DATABASE_URL` to `fastapi-rag\.env`, then open <http://127.0.0.1:8000/docs>.
-Redis runs locally at `redis://localhost:6379/0` through Docker Compose.
+Add `GROQ_API_KEY`, `DATABASE_URL`, and `REDIS_URL` to `fastapi-rag\.env`, then open <http://127.0.0.1:8000/docs>.
+For the current single-tenant demo configuration, set `USE_MOCK_TENANT=true` and `MOCK_TENANT_ID=acme_corp`. Redis runs locally at `redis://localhost:6379/0` through Docker Compose.
 
 Run the test suite from the repository root:
 
@@ -109,9 +153,12 @@ pytest
 |   |-- semantic_cache.py # Redis vector-similarity response cache
 |   `-- .env            # Local secrets; ignored by Git
 |-- tests/              # DB- and API-key-free automated tests
+|   |-- test_api.py     # FastAPI contract and background-task tests
+|   |-- test_chunking.py # Chunk overlap behavior tests
+|   `-- test_semantic_cache.py # Cache similarity and tenant-isolation tests
 |-- docker-compose.yml  # Persistent pgvector service
 |-- requirements.txt    # Runtime dependencies
-|-- requirements-dev.txt# Test dependencies
+|-- requirements-dev.txt # Test dependencies
 |-- .env.example        # Safe environment template
 `-- LICENSE             # MIT license
 ```
@@ -128,15 +175,17 @@ pytest
 - **Hybrid search:** combines dense embeddings for semantic meaning with sparse PostgreSQL full-text matching for exact entities such as `ERR-4042`.
 - **Reranking:** expands `/ask` retrieval to 15 candidates, then uses a local CrossEncoder to select the 3 most relevant context chunks for generation.
 - **Semantic caching:** stores query embeddings and validated answers in Redis for one hour; a cosine similarity above `0.95` returns the cached answer without calling Groq.
+- **Tenant isolation:** uses one resolved tenant ID for retrieval and Redis cache namespaces, preventing cross-tenant search results and cache leaks; document listing still needs authentication-aware filtering.
+- **Full-text indexing:** stores PostgreSQL `TSVECTOR` values on chunks and declares a GIN index so keyword search does not recompute vectors for every row.
 
 ## Roadmap
 
 - Next.js chat UI
-- Hybrid search (BM25 + vector)
-- Reranking
 - Golden evaluation dataset
 - Multi-tenant metadata filters
 - LangGraph agent mode
+- Redis vector index to replace the current tenant-scoped `SCAN` cache lookup at very large cache sizes
+- Durable background job queue to replace FastAPI in-process `BackgroundTasks`
 
 ## License
 
