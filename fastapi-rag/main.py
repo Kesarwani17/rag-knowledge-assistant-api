@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from sqlalchemy import desc, func, select, text
 
 from llm import generate_answer, RAGResponse
-from database import Base, SessionLocal, engine
+from database import Base, SessionLocal, engine, init_db
 import models
 from chunking import chunk_text
 from embeddings import get_embedding
@@ -17,12 +17,7 @@ from semantic_cache import cache_response, get_cached_response
 
 load_dotenv()
 
-# Enable pgvector extension
-with engine.connect() as conn:
-    conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
-    conn.commit()
-
-Base.metadata.create_all(bind=engine)
+init_db()
 
 app = FastAPI(title="RAG Learning API")
 
@@ -37,6 +32,7 @@ class DocumentIn(BaseModel):
 
     title: str = Field(..., min_length=1)
     content: str = Field(..., min_length=1)
+    tenant_id: str = Field(..., min_length=1)
 
 class SearchQuery(BaseModel):
     """Request body for semantic document search."""
@@ -56,14 +52,13 @@ def create_document(doc: DocumentIn) -> dict[str, object]:
     """Store a source document and return its generated identifier."""
     db = SessionLocal()
     
-    useMockTenant = os.getenv("USE_MOCK_TENANT")
-    if os.getenv("USE_MOCK_TENANT", "false").lower() == "true":
-        print("Using mock tenant ID for document creation.")
+    useMockTenant = os.getenv("USE_MOCK_TENANT", "false").lower() == "true"
+    if useMockTenant:
         tenant_id = os.getenv("MOCK_TENANT_ID")
         if not tenant_id:
             raise RuntimeError("MOCK_TENANT_ID must be set")
     else:
-        tenant_id = doc.tenant_id
+        tenant_id = doc.tenant_id # Now this works!
 
     try:
         new_doc = models.Document(title=doc.title, content=doc.content, tenant_id=tenant_id)

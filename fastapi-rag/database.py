@@ -24,12 +24,13 @@ Base = declarative_base()
 
 
 def init_db() -> None:
-    """Enable pgvector and verify database connectivity."""
+    """Create the fresh database schema and enable pgvector for the app."""
     with engine.connect() as conn:
         # Enable pgvector extension
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
         conn.commit()
 
+    Base.metadata.create_all(bind=engine)
     print("Database connected")
     print("pgvector extension enabled")
 

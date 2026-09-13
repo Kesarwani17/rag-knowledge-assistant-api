@@ -44,6 +44,7 @@ def load_api_without_external_services():
     )
     fake_database.SessionLocal = lambda: None
     fake_database.engine = types.SimpleNamespace(connect=FakeConnection)
+    fake_database.init_db = lambda: None
 
     fake_models = types.ModuleType("models")
     fake_llm = types.ModuleType("llm")
