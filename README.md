@@ -58,8 +58,10 @@ flowchart TB
 - Background-task ingestion with a status endpoint for long-running embedding workloads.
 - Redis semantic caching with cosine similarity to bypass duplicate LLM calls.
 - Tenant-scoped retrieval and cache isolation through `tenant_id`.
+- Tenant-scoped document listing, processing, and status checks.
 - Persistent ingestion lifecycle states: `pending`, `processing`, `completed`, and `failed`.
 - GIN-indexed PostgreSQL `TSVECTOR` search column populated when chunks are ingested.
+- Reproducible seeding from official OWASP Cheat Sheet Series Markdown documents, with source and license attribution.
 
 ## API reference
 
@@ -96,11 +98,12 @@ Example `/documents` request:
 ```json
 {
   "title": "Return Policy",
-  "content": "Returns are accepted within 30 days."
+  "content": "Returns are accepted within 30 days.",
+  "tenant_id": "acme_corp"
 }
 ```
 
-In the current demo configuration, document tenancy is selected from `MOCK_TENANT_ID`; production authentication should replace this with the tenant from the request identity.
+In the current demo configuration, set `USE_MOCK_TENANT=true` and `MOCK_TENANT_ID=acme_corp` to use one tenant for document creation and retrieval. Otherwise, `tenant_id` from the request is stored for the document, while reads use `MOCK_TENANT_ID` as the active tenant. Production authentication should replace this configuration with the tenant from the request identity.
 
 Example `/search` request:
 
@@ -131,6 +134,14 @@ uvicorn main:app --reload
 Add `GROQ_API_KEY`, `DATABASE_URL`, and `REDIS_URL` to `fastapi-rag\.env`, then open <http://127.0.0.1:8000/docs>.
 For the current single-tenant demo configuration, set `USE_MOCK_TENANT=true` and `MOCK_TENANT_ID=acme_corp`. Redis runs locally at `redis://localhost:6379/0` through Docker Compose.
 
+To seed the database with real public security guidance from the official OWASP Cheat Sheet Series, keep the API running and execute this from the repository root:
+
+```powershell
+fastapi-rag\venv\Scripts\python.exe scripts\seed.py
+```
+
+The seeder downloads 17 curated OWASP Markdown documents, stores their canonical source URLs and CC BY-SA 4.0 attribution, and waits for each document to reach `completed`. It skips documents whose titles already exist for the active tenant. For a clean disposable database, truncate the document tables before running it again.
+
 Run the test suite from the repository root:
 
 ```powershell
@@ -152,6 +163,8 @@ pytest
 |   |-- reranker.py     # Local CrossEncoder relevance reranking
 |   |-- semantic_cache.py # Redis vector-similarity response cache
 |   `-- .env            # Local secrets; ignored by Git
+|-- scripts/
+|   `-- seed.py         # Seeds official OWASP source documents through the API
 |-- tests/              # DB- and API-key-free automated tests
 |   |-- test_api.py     # FastAPI contract and background-task tests
 |   |-- test_chunking.py # Chunk overlap behavior tests
@@ -175,7 +188,7 @@ pytest
 - **Hybrid search:** combines dense embeddings for semantic meaning with sparse PostgreSQL full-text matching for exact entities such as `ERR-4042`.
 - **Reranking:** expands `/ask` retrieval to 15 candidates, then uses a local CrossEncoder to select the 3 most relevant context chunks for generation.
 - **Semantic caching:** stores query embeddings and validated answers in Redis for one hour; a cosine similarity above `0.95` returns the cached answer without calling Groq.
-- **Tenant isolation:** uses one resolved tenant ID for retrieval and Redis cache namespaces, preventing cross-tenant search results and cache leaks; document listing still needs authentication-aware filtering.
+- **Tenant isolation:** uses one resolved tenant ID for retrieval, document listing/status/processing checks, and Redis cache namespaces, preventing cross-tenant results and cache leaks; production authentication should replace the current demo tenant configuration.
 - **Full-text indexing:** stores PostgreSQL `TSVECTOR` values on chunks and declares a GIN index so keyword search does not recompute vectors for every row.
 
 ## Roadmap
