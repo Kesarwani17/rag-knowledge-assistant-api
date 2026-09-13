@@ -117,6 +117,7 @@ def test_process_trigger_queues_work_and_reports_processing():
         """Database document stand-in for status persistence assertions."""
 
         id = FakeColumn()
+        tenant_id = FakeColumn()
 
         def __init__(self):
             self.status = "pending"
@@ -126,7 +127,7 @@ def test_process_trigger_queues_work_and_reports_processing():
     class FakeQuery:
         """Minimal SQLAlchemy query chain used by the status routes."""
 
-        def filter(self, expression):
+        def filter(self, *expressions):
             return self
 
         def first(self):

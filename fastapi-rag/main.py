@@ -5,10 +5,10 @@ import os
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from sqlalchemy import desc, func, select, text
+from sqlalchemy import desc, func, select
 
 from llm import generate_answer, RAGResponse
-from database import Base, SessionLocal, engine, init_db
+from database import SessionLocal, init_db
 import models
 from chunking import chunk_text
 from embeddings import get_embedding
@@ -52,13 +52,13 @@ def create_document(doc: DocumentIn) -> dict[str, object]:
     """Store a source document and return its generated identifier."""
     db = SessionLocal()
     
-    useMockTenant = os.getenv("USE_MOCK_TENANT", "false").lower() == "true"
-    if useMockTenant:
+    use_mock_tenant = os.getenv("USE_MOCK_TENANT", "false").lower() == "true"
+    if use_mock_tenant:
         tenant_id = os.getenv("MOCK_TENANT_ID")
         if not tenant_id:
             raise RuntimeError("MOCK_TENANT_ID must be set")
     else:
-        tenant_id = doc.tenant_id # Now this works!
+        tenant_id = doc.tenant_id
 
     try:
         new_doc = models.Document(title=doc.title, content=doc.content, tenant_id=tenant_id)
@@ -75,7 +75,12 @@ def list_documents() -> list[dict[str, object]]:
     """Return all stored source documents."""
     db = SessionLocal()
     try:
-        docs = db.query(models.Document).all()
+        tenant_id = get_current_tenant_id()
+        docs = (
+            db.query(models.Document)
+            .filter(models.Document.tenant_id == tenant_id)
+            .all()
+        )
         return [{"id": d.id, "title": d.title, "content": d.content} for d in docs]
     finally:
         db.close()
@@ -188,9 +193,22 @@ def trigger_process(doc_id: int, background_tasks: BackgroundTasks) -> dict[str,
     """Queue document processing and return before embedding work begins."""
     db = SessionLocal()
     try:
-        doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+        tenant_id = get_current_tenant_id()
+        doc = (
+            db.query(models.Document)
+            .filter(
+                models.Document.id == doc_id,
+                models.Document.tenant_id == tenant_id,
+            )
+            .first()
+        )
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
+
+        if doc.status == "processing":
+            raise HTTPException(status_code=409, detail="Document is already processing")
+        if doc.status == "completed":
+            raise HTTPException(status_code=409, detail="Document is already processed")
 
         doc.status = "processing"
         db.commit()
@@ -209,7 +227,15 @@ def get_document_status(doc_id: int) -> dict[str, str]:
     """Return the current background processing status for a document."""
     db = SessionLocal()
     try:
-        doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+        tenant_id = get_current_tenant_id()
+        doc = (
+            db.query(models.Document)
+            .filter(
+                models.Document.id == doc_id,
+                models.Document.tenant_id == tenant_id,
+            )
+            .first()
+        )
         if not doc:
             raise HTTPException(status_code=404, detail="Document not found")
         return {"status": doc.status}

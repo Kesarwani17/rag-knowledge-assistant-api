@@ -68,7 +68,8 @@ def process_one(doc: dict, existing_titles: set) -> str:
         res.raise_for_status()
         doc_id = res.json()["id"]
         
-        requests.post(f"{API}/documents/{doc_id}/process")
+        process_response = requests.post(f"{API}/documents/{doc_id}/process")
+        process_response.raise_for_status()
         status = wait_for(doc_id)
         return f"{status:>9}: {doc['title']} (id={doc_id})"
     except Exception as e:
