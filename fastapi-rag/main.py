@@ -81,6 +81,69 @@ def list_documents() -> list[dict[str, object]]:
         db.close()
 
 
+def retrieve_chunks(
+    db,
+    query: str,
+    tenant_id: str,
+    limit: int,
+    query_embedding: list[float] | None = None,
+) -> tuple[list[dict[str, object]], list[float]]:
+    """Retrieve tenant-scoped chunks with dense and full-text search."""
+    if query_embedding is None:
+        query_embedding = get_embedding(query)
+
+    vector_stmt = (
+        select(
+            models.DocumentChunk,
+            models.DocumentChunk.embedding.cosine_distance(query_embedding).label("distance"),
+        )
+        .where(models.DocumentChunk.tenant_id == tenant_id)
+        .order_by("distance")
+        .limit(limit)
+    )
+    vector_results = db.execute(vector_stmt).all()
+
+    keyword_stmt = (
+        select(
+            models.DocumentChunk,
+            func.ts_rank(
+                models.DocumentChunk.search_vector,
+                func.plainto_tsquery("english", query),
+            ).label("keyword_score"),
+        )
+        .where(
+            models.DocumentChunk.tenant_id == tenant_id,
+            models.DocumentChunk.search_vector.match(query),
+        )
+        .order_by(desc("keyword_score"))
+        .limit(limit)
+    )
+    keyword_results = db.execute(keyword_stmt).all()
+
+    chunks: list[dict[str, object]] = []
+    chunk_ids: set[int] = set()
+    for chunk, distance in vector_results:
+        similarity = 1.0 - float(distance)
+        if similarity >= 0.35:
+            chunks.append({
+                "text": chunk.chunk_text,
+                "document_id": chunk.document_id,
+                "similarity_score": round(similarity, 4),
+            })
+            chunk_ids.add(chunk.id)
+
+    for chunk, keyword_score in keyword_results:
+        if chunk.id not in chunk_ids:
+            chunks.append({
+                "text": chunk.chunk_text,
+                "document_id": chunk.document_id,
+                "similarity_score": round(float(keyword_score), 4),
+            })
+            chunk_ids.add(chunk.id)
+
+    return chunks, query_embedding
+
+
 def process_heavy_document(doc_id: int) -> None:
     """Chunk and embed a stored document in a background task."""
     db = SessionLocal()
@@ -160,56 +223,8 @@ def search_documents(req: SearchQuery) -> list[dict[str, object]]:
     db = SessionLocal()
     try:
         tenant_id = get_current_tenant_id()
-        # Dense retrieval captures semantic meaning.
-        query_embedding = get_embedding(req.query)
-        vector_stmt = (
-            select(
-                models.DocumentChunk,
-                models.DocumentChunk.embedding.cosine_distance(query_embedding).label("distance")
-            )
-            .where(models.DocumentChunk.tenant_id == tenant_id)
-            .order_by("distance")
-            .limit(req.top_k)
-        )
-        vector_results = db.execute(vector_stmt).all()
-
-        # Sparse retrieval preserves exact entities such as error codes and SKUs.
-        keyword_stmt = (
-            select(
-                models.DocumentChunk,
-                func.ts_rank(
-                    models.DocumentChunk.search_vector,
-                    func.plainto_tsquery("english", req.query),
-                ).label("keyword_score"),
-            )
-            .where(
-                models.DocumentChunk.tenant_id == tenant_id,
-                models.DocumentChunk.search_vector.match(req.query),
-            )
-            .order_by(desc("keyword_score"))
-            .limit(req.top_k)
-        )
-        keyword_results = db.execute(keyword_stmt).all()
-
-        combined_results: dict[int, dict[str, object]] = {}
-        for chunk, distance in vector_results:
-            combined_results[chunk.id] = {
-                "text": chunk.chunk_text,
-                "document_id": chunk.document_id,
-                "similarity_score": round(1.0 - float(distance), 4),
-            }
-
-        for chunk, keyword_score in keyword_results:
-            combined_results.setdefault(
-                chunk.id,
-                {
-                    "text": chunk.chunk_text,
-                    "document_id": chunk.document_id,
-                    "similarity_score": round(float(keyword_score), 4),
-                },
-            )
-
-        return list(combined_results.values())[: req.top_k]
+        chunks, _ = retrieve_chunks(db, req.query, tenant_id, req.top_k)
+        return chunks[: req.top_k]
     finally:
         db.close()
 
@@ -223,36 +238,13 @@ def ask_question(req: AskQuery) -> RAGResponse:
     """Retrieve, rerank, and generate a grounded answer from relevant chunks."""
     db = SessionLocal()
     try:
-        # 1. RETRIEVAL: Get a broad candidate set for local reranking
         query_embedding = get_embedding(req.query)
         tenant_id = get_current_tenant_id()
         cached_response = get_cached_response(tenant_id, query_embedding)
         if cached_response:
             return cached_response
 
-        stmt = (
-            select(
-                models.DocumentChunk,
-                models.DocumentChunk.embedding.cosine_distance(query_embedding).label("distance")
-            )
-            .where(models.DocumentChunk.tenant_id == tenant_id)
-            .order_by("distance")
-            .limit(15)
-        )
-        results = db.execute(stmt).all()
-
-        chunks = []
-
-        for c, distance in results:
-            similarity = 1.0 - float(distance)
-
-            # Ignore weak/irrelevant matches
-            if similarity >= 0.35:
-                chunks.append({
-                    "text": c.chunk_text,
-                    "document_id": c.document_id,
-                    "similarity_score": round(similarity, 4)
-                })
+        chunks, _ = retrieve_chunks(db, req.query, tenant_id, 15, query_embedding)
 
         if not chunks:
             return RAGResponse(
