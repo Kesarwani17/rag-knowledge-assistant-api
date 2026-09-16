@@ -142,6 +142,14 @@ fastapi-rag\venv\Scripts\python.exe scripts\seed.py
 
 The seeder downloads 17 curated OWASP Markdown documents, stores their canonical source URLs and CC BY-SA 4.0 attribution, and waits for each document to reach `completed`. It skips documents whose titles already exist for the active tenant. For a clean disposable database, truncate the document tables before running it again.
 
+To exercise health checks, the full RAG pipeline, semantic caching, hallucination protection, and server-side citations in one run, execute the demo after seeding:
+
+```powershell
+fastapi-rag\venv\Scripts\python.exe scripts\demo.py
+```
+
+The demo requires the API, PostgreSQL, pgvector, Redis, and `GROQ_API_KEY` to be available. Stage 2 repeats the exact Stage 1 query so the semantic-cache assertion is deterministic. A previous run may already have cached Stage 1, so its label describes the expected pipeline rather than guaranteeing a cache miss.
+
 Run the test suite from the repository root:
 
 ```powershell
@@ -164,7 +172,8 @@ pytest
 |   |-- semantic_cache.py # Redis vector-similarity response cache
 |   `-- .env            # Local secrets; ignored by Git
 |-- scripts/
-|   `-- seed.py         # Seeds official OWASP source documents through the API
+|   |-- seed.py         # Seeds official OWASP source documents through the API
+|   `-- demo.py         # Exercises the main RAG features end to end
 |-- tests/              # DB- and API-key-free automated tests
 |   |-- test_api.py     # FastAPI contract and background-task tests
 |   |-- test_chunking.py # Chunk overlap behavior tests
