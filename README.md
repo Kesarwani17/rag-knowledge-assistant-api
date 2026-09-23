@@ -124,11 +124,11 @@ From PowerShell:
 docker compose up -d
 py -3.11 -m venv fastapi-rag\venv
 fastapi-rag\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 Copy-Item .env.example fastapi-rag\.env
 notepad fastapi-rag\.env
 Set-Location fastapi-rag
-uvicorn main:app --reload
+python -m uvicorn main:app --reload
 ```
 
 Add `GROQ_API_KEY`, `DATABASE_URL`, and `REDIS_URL` to `fastapi-rag\.env`, then open <http://127.0.0.1:8000/docs>.
@@ -153,7 +153,7 @@ The demo requires the API, PostgreSQL, pgvector, Redis, and `GROQ_API_KEY` to be
 Run the test suite from the repository root:
 
 ```powershell
-pip install -r requirements-dev.txt
+python -m pip install -r requirements-dev.txt
 pytest
 ```
 
