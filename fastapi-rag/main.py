@@ -14,6 +14,7 @@ from chunking import chunk_text
 from embeddings import get_embedding
 from reranker import rerank_chunks
 from semantic_cache import cache_response, get_cached_response
+from jev_guard import CONFIDENCE_THRESHOLD, USE_JEV, is_answerable
 
 load_dotenv()
 
@@ -280,6 +281,16 @@ def ask_question(req: AskQuery) -> RAGResponse:
             )
         # 2. RERANKING: Let the local CrossEncoder select the best context.
         chunks = rerank_chunks(req.query, chunks)[:3]
+
+        if USE_JEV:
+            context_text = "\n\n".join(c["text"] for c in chunks)
+            answerable, confidence = is_answerable(req.query, context_text)
+            if not answerable and confidence >= CONFIDENCE_THRESHOLD:
+                return RAGResponse(
+                    answer="I cannot answer this based on the provided documents.",
+                    is_hallucination=True,
+                    source_document_ids=[],
+                )
 
         # 3. GENERATION: Send only the top 3 chunks to Groq with guardrails
         llm_response = generate_answer(req.query, chunks)
