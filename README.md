@@ -5,9 +5,39 @@ Production-style retrieval-augmented generation backend with vector search, stru
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.141.1-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![pgvector](https://img.shields.io/badge/pgvector-vector%20search-336791?logo=postgresql&logoColor=white)](https://github.com/pgvector/pgvector)
+[![Redis](https://img.shields.io/badge/Redis-semantic%20cache-DC382D?logo=redis&logoColor=white)](https://redis.io/)
+[![Docker](https://img.shields.io/badge/Docker-local%20services-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
+[![Pydantic](https://img.shields.io/badge/Pydantic-structured%20outputs-E92063?logo=pydantic&logoColor=white)](https://docs.pydantic.dev/)
+[![Pytest](https://img.shields.io/badge/Pytest-13%20tests-0A9EDC?logo=pytest&logoColor=white)](https://docs.pytest.org/)
+[![Sentence Transformers](https://img.shields.io/badge/Sentence--Transformers-local%20models-FCC624?logo=huggingface&logoColor=black)](https://www.sbert.net/)
+[![Jev](https://img.shields.io/badge/Jev-optional%20answerability%20guard-7B61FF?logo=shield&logoColor=white)](fastapi-rag/jev_guard.py)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 **Stack:** FastAPI · PostgreSQL + pgvector · Redis · sentence-transformers · Groq (OpenAI-compatible) · Pydantic v2 · Docker
+
+This repository is a focused backend reference implementation for grounded question answering: documents are ingested into a tenant-scoped knowledge base, retrieved with both semantic and keyword search, reranked locally, and answered with structured LLM output that carries server-verified citations.
+
+<table>
+  <tr>
+    <td><strong>Knowledge base</strong><br>Tenant-scoped documents with vector and full-text search</td>
+    <td><strong>Grounded answers</strong><br>Structured responses with server-verified citations</td>
+    <td><strong>Operations</strong><br>Docker-backed PostgreSQL and Redis services</td>
+  </tr>
+</table>
+
+> **Pipeline:** ingest, retrieve, rerank, optionally verify with Jev, then generate.
+> The Jev guard is disabled by default and fails open when enabled but unavailable.
+
+<table>
+  <tr>
+    <td><strong>API engineering</strong><br>FastAPI routes, Pydantic schemas, background tasks, and OpenAPI docs</td>
+    <td><strong>Search and RAG</strong><br>Hybrid retrieval, pgvector, full-text search, local embeddings, and reranking</td>
+    <td><strong>Reliability</strong><br>Tenant isolation, semantic caching, validation, citations, and offline tests</td>
+  </tr>
+</table>
+
+> **Optional guardrail — Jev System-1:** a typed, confidence-aware answerability check that can refuse out-of-scope questions before LLM generation. It is disabled by default and fails open when enabled but unavailable.
 
 ## What it does
 
@@ -38,9 +68,12 @@ flowchart TB
     L --> M[CrossEncoder reranker]
     M --> N[(Redis semantic cache)]
     N -- cache hit --> O[Validated cached response]
-    N -- cache miss --> P[Groq structured output]
-    P --> Q[Server-side source IDs]
-    O --> Q
+    N -- cache miss --> P{Jev enabled?}
+    P -- no or fail-open --> Q[Groq structured output]
+    P -- high-confidence refusal --> R[Grounded refusal]
+    P -- yes --> Q
+    Q --> S[Server-side source IDs]
+    O --> S
   end
 ```
 
@@ -57,11 +90,25 @@ flowchart TB
 - Deterministic `temperature=0` generation.
 - Background-task ingestion with a status endpoint for long-running embedding workloads.
 - Redis semantic caching with cosine similarity to bypass duplicate LLM calls.
+- Optional Jev System-1 answerability guard (feature-flagged, fail-open) refuses out-of-scope queries before LLM generation.
 - Tenant-scoped retrieval and cache isolation through `tenant_id`.
 - Tenant-scoped document listing, processing, and status checks.
 - Persistent ingestion lifecycle states: `pending`, `processing`, `completed`, and `failed`.
 - GIN-indexed PostgreSQL `TSVECTOR` search column populated when chunks are ingested.
 - Reproducible seeding from official OWASP Cheat Sheet Series Markdown documents, with source and license attribution.
+
+## Request flow
+
+The main question-answering path is intentionally ordered from inexpensive checks to deeper work:
+
+1. Resolve the active tenant and query embedding.
+2. Return a sufficiently similar cached answer when available.
+3. Retrieve tenant-scoped candidates using pgvector and PostgreSQL full-text search.
+4. Reject empty or weak context, then rerank the best candidates locally.
+5. Optionally ask Jev whether the top context can answer the question. A high-confidence refusal stops before generation; Jev errors fail open.
+6. Generate a Pydantic-validated answer and derive source document IDs from retrieved rows.
+
+The guard is disabled by default, so deployments that leave `USE_JEV` unset retain the original retrieval, cache, and generation behavior.
 
 ## API reference
 
@@ -134,6 +181,19 @@ uvicorn main:app --reload
 Add `GROQ_API_KEY`, `DATABASE_URL`, and `REDIS_URL` to `fastapi-rag\.env`, then open <http://127.0.0.1:8000/docs>.
 For the current single-tenant demo configuration, set `USE_MOCK_TENANT=true` and `MOCK_TENANT_ID=acme_corp`. Redis runs locally at `redis://localhost:6379/0` through Docker Compose.
 
+### Optional Jev configuration
+
+Jev is disabled by default and is designed to fail open. Enable it only when a TypeSafe-compatible endpoint and API key are available:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `USE_JEV` | `false` | Enables the answerability check before LLM generation. |
+| `JEV_API_KEY` | empty | Bearer token sent to the Jev endpoint. |
+| `JEV_API_URL` | `https://api.typesafe.ai/v1/decide` | Jev decision endpoint. |
+| `JEV_CONFIDENCE_THRESHOLD` | `0.9` | Minimum refusal confidence required to stop generation. |
+
+The request schema in `fastapi-rag/jev_guard.py` is intentionally isolated because the TypeSafe API contract is still provisional.
+
 To seed the database with real public security guidance from the official OWASP Cheat Sheet Series, keep the API running and execute this from the repository root:
 
 ```powershell
@@ -170,6 +230,7 @@ pytest
 |   |-- llm.py          # Groq structured generation and guardrails
 |   |-- reranker.py     # Local CrossEncoder relevance reranking
 |   |-- semantic_cache.py # Redis vector-similarity response cache
+|   |-- jev_guard.py      # Optional fail-open answerability guard
 |   `-- .env            # Local secrets; ignored by Git
 |-- scripts/
 |   |-- seed.py         # Seeds official OWASP source documents through the API
@@ -177,7 +238,8 @@ pytest
 |-- tests/              # DB- and API-key-free automated tests
 |   |-- test_api.py     # FastAPI contract and background-task tests
 |   |-- test_chunking.py # Chunk overlap behavior tests
-|   `-- test_semantic_cache.py # Cache similarity and tenant-isolation tests
+|   |-- test_semantic_cache.py # Cache similarity and tenant-isolation tests
+|   `-- test_jev_guard.py # Offline Jev decision and fail-open tests
 |-- docker-compose.yml  # Persistent pgvector service
 |-- requirements.txt    # Runtime dependencies
 |-- requirements-dev.txt # Test dependencies
@@ -199,6 +261,8 @@ pytest
 - **Semantic caching:** stores query embeddings and validated answers in Redis for one hour; a cosine similarity above `0.95` returns the cached answer without calling Groq.
 - **Tenant isolation:** uses one resolved tenant ID for retrieval, document listing/status/processing checks, and Redis cache namespaces, preventing cross-tenant results and cache leaks; production authentication should replace the current demo tenant configuration.
 - **Full-text indexing:** stores PostgreSQL `TSVECTOR` values on chunks and declares a GIN index so keyword search does not recompute vectors for every row.
+- **Guard cheap, verify deep:** the optional Jev System-1 guard checks whether the top retrieved context can answer the question before the expensive LLM call; fail-open semantics allow generation to continue when Jev is unavailable or returns malformed data.
+- **Operational simplicity:** PostgreSQL and Redis are the only services required by the local stack; embedding and reranking models run in the API process, while Docker provides the stateful dependencies.
 
 ## Roadmap
 
