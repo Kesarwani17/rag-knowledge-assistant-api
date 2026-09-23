@@ -38,15 +38,138 @@ def load_api_without_external_services():
         def commit(self):
             return None
 
+    class FakeColumn:
+        """Mini column object that supports equality comparisons used by filter calls."""
+
+        def __init__(self, name):
+            self.name = name
+
+        def __eq__(self, other):
+            return (self.name, other)
+
+    class FakeOrganization:
+        email = FakeColumn("email")
+
+        def __init__(self, name=None, slug=None):
+            self.id = None
+            self.name = name
+            self.slug = slug
+
+    class FakeUser:
+        email = FakeColumn("email")
+        token = FakeColumn("token")
+
+        def __init__(self, email=None, password_hash=None, organization_id=None, role="member"):
+            self.id = None
+            self.email = email
+            self.password_hash = password_hash
+            self.organization_id = organization_id
+            self.role = role
+
+    class FakeAPIToken:
+        token = FakeColumn("token")
+
+        def __init__(self, token=None, user_id=None, organization_id=None, role="member"):
+            self.id = None
+            self.token = token
+            self.user_id = user_id
+            self.organization_id = organization_id
+            self.role = role
+
+    class FakeQuery:
+        """Minimal query object used by the tenant auth routes."""
+
+        def __init__(self, session, model):
+            self.session = session
+            self.model = model
+            self._filters = []
+
+        def filter(self, *args, **kwargs):
+            self._filters.extend(args)
+            self._filters.extend(kwargs.items())
+            return self
+
+        def first(self):
+            if self.model is FakeUser:
+                for predicate in self._filters:
+                    if isinstance(predicate, tuple):
+                        left, right = predicate
+                        left_name = getattr(left, "name", None)
+                        if left_name == "email" or left == "email":
+                            for user in self.session.users:
+                                if user.email == right:
+                                    return user
+                return None
+            if self.model is FakeAPIToken:
+                for predicate in self._filters:
+                    if isinstance(predicate, tuple):
+                        left, right = predicate
+                        left_name = getattr(left, "name", None)
+                        if left_name == "token" or left == "token":
+                            for token in self.session.tokens:
+                                if token.token == right:
+                                    return token
+                return None
+            return None
+
+    class FakeSession:
+        """In-memory session used by offline tests."""
+
+        def __init__(self):
+            self.organizations = []
+            self.users = []
+            self.tokens = []
+
+        def query(self, model):
+            return FakeQuery(self, model)
+
+        def add(self, obj):
+            if isinstance(obj, FakeOrganization):
+                self.organizations.append(obj)
+            elif isinstance(obj, FakeUser):
+                self.users.append(obj)
+            elif isinstance(obj, FakeAPIToken):
+                self.tokens.append(obj)
+
+        def commit(self):
+            for item in self.organizations:
+                if item.id is None:
+                    item.id = len(self.organizations)
+            for item in self.users:
+                if item.id is None:
+                    item.id = len(self.users)
+            for item in self.tokens:
+                if item.id is None:
+                    item.id = len(self.tokens)
+
+        def refresh(self, obj):
+            if isinstance(obj, FakeOrganization):
+                if obj.id is None:
+                    obj.id = len(self.organizations)
+            elif isinstance(obj, FakeUser):
+                if obj.id is None:
+                    obj.id = len(self.users)
+            elif isinstance(obj, FakeAPIToken):
+                if obj.id is None:
+                    obj.id = len(self.tokens)
+
+        def close(self):
+            return None
+
+    shared_session = FakeSession()
+
     fake_database = types.ModuleType("database")
     fake_database.Base = types.SimpleNamespace(
         metadata=types.SimpleNamespace(create_all=lambda bind: None)
     )
-    fake_database.SessionLocal = lambda: None
+    fake_database.SessionLocal = lambda: shared_session
     fake_database.engine = types.SimpleNamespace(connect=FakeConnection)
     fake_database.init_db = lambda: None
 
     fake_models = types.ModuleType("models")
+    fake_models.Organization = FakeOrganization
+    fake_models.User = FakeUser
+    fake_models.APIToken = FakeAPIToken
     fake_llm = types.ModuleType("llm")
     fake_llm.RAGResponse = FakeRAGResponse
     fake_llm.generate_answer = lambda query, context_chunks: FakeRAGResponse()
@@ -181,3 +304,49 @@ def test_process_trigger_queues_work_and_reports_processing():
     assert background_tasks.tasks[0].func is app_module.process_heavy_document
     assert document.status == "processing"
     assert app_module.get_document_status(42) == {"status": "processing"}
+
+
+def test_admin_can_create_organization_and_issue_token():
+    """The admin bootstrap flow should create an organization and issue a tenant-scoped token."""
+    app_module = load_api_without_external_services()
+
+    org_response = TestClient(app_module.app).post(
+        "/admin/organizations",
+        json={"name": "Acme Health"},
+    )
+    assert org_response.status_code == 200
+    assert org_response.json()["name"] == "Acme Health"
+
+    user_response = TestClient(app_module.app).post(
+        "/admin/users",
+        json={
+            "email": "alice@acme.com",
+            "password": "secret123",
+            "organization_id": 1,
+            "role": "admin",
+        },
+    )
+    assert user_response.status_code == 200
+    assert user_response.json()["email"] == "alice@acme.com"
+
+    token_response = TestClient(app_module.app).post(
+        "/admin/tokens",
+        json={"email": "alice@acme.com", "password": "secret123", "organization_id": 1},
+    )
+    assert token_response.status_code == 200
+    assert token_response.json()["organization_id"] == 1
+    assert token_response.json()["token"]
+
+
+def test_protected_route_requires_valid_bearer_token():
+    """Protected tenant-scoped routes should reject missing or invalid bearer tokens."""
+    app_module = load_api_without_external_services()
+
+    response = TestClient(app_module.app).get("/me")
+    assert response.status_code == 401
+
+    response = TestClient(app_module.app).get(
+        "/me",
+        headers={"Authorization": "Bearer invalid-token"},
+    )
+    assert response.status_code == 401

@@ -1,8 +1,11 @@
 """FastAPI application exposing document ingestion, retrieval, and RAG answers."""
 
 import os
+import uuid
+from datetime import datetime, timedelta, timezone
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from sqlalchemy import desc, func, select
@@ -21,11 +24,50 @@ load_dotenv()
 init_db()
 
 app = FastAPI(title="RAG Learning API")
+security = HTTPBearer(auto_error=False)
 
 
 def get_current_tenant_id() -> str:
     """Return the configured tenant identifier for the current deployment."""
     return os.getenv("MOCK_TENANT_ID", "default")
+
+
+def _hash_password(password: str) -> str:
+    """Create a minimal deterministic password hash for demo/admin flows."""
+    return f"hashed::{password}::{len(password)}"
+
+
+def _is_valid_token(token_value: str | None) -> bool:
+    """Return whether the token exists in the product-style auth registry."""
+    if not token_value:
+        return False
+    db = SessionLocal()
+    try:
+        token = db.query(models.APIToken).filter(models.APIToken.token == token_value).first()
+        return token is not None
+    finally:
+        db.close()
+
+
+def get_authenticated_context(
+    creds: HTTPAuthorizationCredentials | None = Depends(security),
+) -> dict[str, object]:
+    """Resolve the active tenant and user from a bearer token if one is supplied."""
+    if creds is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
+
+    token_value = creds.credentials
+    if not _is_valid_token(token_value):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
+
+    db = SessionLocal()
+    try:
+        token = db.query(models.APIToken).filter(models.APIToken.token == token_value).first()
+        if not token:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
+        return {"tenant_id": str(token.organization_id), "user_id": token.user_id, "role": token.role}
+    finally:
+        db.close()
 
 
 class DocumentIn(BaseModel):
@@ -79,6 +121,56 @@ class HealthResponse(BaseModel):
 
     status: str
 
+
+class OrganizationCreateRequest(BaseModel):
+    """Admin request to create a new organization."""
+
+    name: str = Field(..., min_length=1, max_length=200)
+
+
+class OrganizationResponse(BaseModel):
+    """Public organization metadata returned by admin routes."""
+
+    id: int
+    name: str
+    slug: str
+
+
+class UserCreateRequest(BaseModel):
+    """Admin request to create a user in an organization."""
+
+    email: str = Field(..., min_length=3, max_length=255)
+    password: str = Field(..., min_length=6, max_length=200)
+    organization_id: int = Field(..., ge=1)
+    role: str = Field(default="member", min_length=1, max_length=64)
+
+
+class UserResponse(BaseModel):
+    """User summary returned after admin creation."""
+
+    id: int
+    email: str
+    organization_id: int
+    role: str
+
+
+class TokenCreateRequest(BaseModel):
+    """Admin request to issue a bearer token."""
+
+    email: str = Field(..., min_length=3, max_length=255)
+    password: str = Field(..., min_length=6, max_length=200)
+    organization_id: int = Field(..., ge=1)
+
+
+class TokenResponse(BaseModel):
+    """Issued token payload for client authentication."""
+
+    token: str
+    user_id: int
+    organization_id: int
+    role: str
+
+
 class SearchQuery(BaseModel):
     """Request body for semantic document search."""
 
@@ -90,6 +182,73 @@ class SearchQuery(BaseModel):
 def health() -> dict[str, str]:
     """Return a lightweight liveness response."""
     return {"status": "ok"}
+
+
+@app.post("/admin/organizations", response_model=OrganizationResponse)
+def create_organization(req: OrganizationCreateRequest) -> dict[str, object]:
+    """Create a tenant organization for product-style multi-tenancy."""
+    db = SessionLocal()
+    try:
+        slug = req.name.strip().lower().replace(" ", "-")
+        org = models.Organization(name=req.name.strip(), slug=slug)
+        db.add(org)
+        db.commit()
+        db.refresh(org)
+        return {"id": org.id, "name": org.name, "slug": org.slug}
+    finally:
+        db.close()
+
+
+@app.post("/admin/users", response_model=UserResponse)
+def create_user(req: UserCreateRequest) -> dict[str, object]:
+    """Create a user and associate them with an organization."""
+    db = SessionLocal()
+    try:
+        user = models.User(
+            email=req.email.strip().lower(),
+            password_hash=_hash_password(req.password),
+            organization_id=req.organization_id,
+            role=req.role,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return {"id": user.id, "email": user.email, "organization_id": user.organization_id, "role": user.role}
+    finally:
+        db.close()
+
+
+@app.post("/admin/tokens", response_model=TokenResponse)
+def issue_token(req: TokenCreateRequest) -> dict[str, object]:
+    """Issue a bearer token for a user in an organization."""
+    db = SessionLocal()
+    try:
+        user = db.query(models.User).filter(models.User.email == req.email.strip().lower()).first()
+        if not user or user.organization_id != req.organization_id:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        if user.password_hash != _hash_password(req.password):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        token_value = f"tenant_{uuid.uuid4().hex}"
+        token = models.APIToken(
+            token=token_value,
+            user_id=user.id,
+            organization_id=user.organization_id,
+            role=user.role,
+        )
+        db.add(token)
+        db.commit()
+        db.refresh(token)
+        return {"token": token.token, "user_id": token.user_id, "organization_id": token.organization_id, "role": token.role}
+    finally:
+        db.close()
+
+
+@app.get("/me", response_model=dict[str, object])
+def me(context: dict[str, object] = Depends(get_authenticated_context)) -> dict[str, object]:
+    """Return the authenticated user's tenant context."""
+    return {"tenant_id": context["tenant_id"], "user_id": context["user_id"], "role": context["role"]}
 
 
 @app.post("/documents", response_model=DocumentResponse)
