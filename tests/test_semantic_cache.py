@@ -63,3 +63,8 @@ def test_cache_does_not_cross_tenants(monkeypatch):
     semantic_cache.cache_response("tenant-a", [1.0, 0.0], response)
 
     assert semantic_cache.get_cached_response("tenant-b", [1.0, 0.0]) is None
+
+
+def test_cosine_similarity_rejects_mismatched_vectors():
+    """Vectors with different dimensions must not be compared partially."""
+    assert semantic_cache.cosine_similarity([1.0, 0.0], [1.0]) == 0.0

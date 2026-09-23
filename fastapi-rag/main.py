@@ -31,24 +31,68 @@ def get_current_tenant_id() -> str:
 class DocumentIn(BaseModel):
     """Request body for storing a source document."""
 
-    title: str = Field(..., min_length=1)
-    content: str = Field(..., min_length=1)
-    tenant_id: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1, max_length=200)
+    content: str = Field(..., min_length=1, max_length=100_000)
+    tenant_id: str = Field(..., min_length=1, max_length=100)
+
+
+class DocumentResponse(BaseModel):
+    """Response returned after a document is stored."""
+
+    id: int
+    title: str
+    status: str
+
+
+class DocumentDetailResponse(BaseModel):
+    """Document fields returned by the tenant-scoped listing endpoint."""
+
+    id: int
+    title: str
+    content: str
+
+
+class ProcessResponse(BaseModel):
+    """Response returned when document processing is queued."""
+
+    status: str
+    doc_id: int
+    message: str
+
+
+class StatusResponse(BaseModel):
+    """Current processing status for a document."""
+
+    status: str
+
+
+class ChunkResponse(BaseModel):
+    """Retrieved chunk and its relevance metadata."""
+
+    text: str
+    document_id: int
+    similarity_score: float
+
+
+class HealthResponse(BaseModel):
+    """Lightweight service health response."""
+
+    status: str
 
 class SearchQuery(BaseModel):
     """Request body for semantic document search."""
 
-    query: str = Field(..., min_length=1)
+    query: str = Field(..., min_length=1, max_length=1_000)
     top_k: int = Field(3, ge=1, le=10)
 
 
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 def health() -> dict[str, str]:
     """Return a lightweight liveness response."""
     return {"status": "ok"}
 
 
-@app.post("/documents")
+@app.post("/documents", response_model=DocumentResponse)
 def create_document(doc: DocumentIn) -> dict[str, object]:
     """Store a source document and return its generated identifier."""
     db = SessionLocal()
@@ -71,7 +115,7 @@ def create_document(doc: DocumentIn) -> dict[str, object]:
         db.close()
 
 
-@app.get("/documents")
+@app.get("/documents", response_model=list[DocumentDetailResponse])
 def list_documents() -> list[dict[str, object]]:
     """Return all stored source documents."""
     db = SessionLocal()
@@ -189,7 +233,7 @@ def process_heavy_document(doc_id: int) -> None:
         db.close()
 
 
-@app.post("/documents/{doc_id}/process")
+@app.post("/documents/{doc_id}/process", response_model=ProcessResponse)
 def trigger_process(doc_id: int, background_tasks: BackgroundTasks) -> dict[str, object]:
     """Queue document processing and return before embedding work begins."""
     db = SessionLocal()
@@ -223,8 +267,8 @@ def trigger_process(doc_id: int, background_tasks: BackgroundTasks) -> dict[str,
         db.close()
 
 
-@app.get("/documents/{doc_id}/status")
-def get_document_status(doc_id: int) -> dict[str, str]:
+@app.get("/documents/{doc_id}/status", response_model=StatusResponse)
+def get_document_status(doc_id: int) -> dict[str, object]:
     """Return the current background processing status for a document."""
     db = SessionLocal()
     try:
@@ -244,7 +288,7 @@ def get_document_status(doc_id: int) -> dict[str, str]:
         db.close()
 
 
-@app.post("/search")
+@app.post("/search", response_model=list[ChunkResponse])
 def search_documents(req: SearchQuery) -> list[dict[str, object]]:
     """Combine dense vector and sparse keyword retrieval for a query."""
     db = SessionLocal()
@@ -258,7 +302,7 @@ def search_documents(req: SearchQuery) -> list[dict[str, object]]:
 class AskQuery(BaseModel):
     """Request body for a guarded question-answering request."""
 
-    query: str = Field(..., min_length=1)
+    query: str = Field(..., min_length=1, max_length=1_000)
 
 @app.post("/ask", response_model=RAGResponse)
 def ask_question(req: AskQuery) -> RAGResponse:

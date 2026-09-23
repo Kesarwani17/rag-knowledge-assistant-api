@@ -12,6 +12,7 @@ Production-style retrieval-augmented generation backend with vector search, stru
 [![Pytest](https://img.shields.io/badge/Pytest-13%20tests-0A9EDC?logo=pytest&logoColor=white)](https://docs.pytest.org/)
 [![Sentence Transformers](https://img.shields.io/badge/Sentence--Transformers-local%20models-FCC624?logo=huggingface&logoColor=black)](https://www.sbert.net/)
 [![Jev](https://img.shields.io/badge/Jev-optional%20answerability%20guard-7B61FF?logo=shield&logoColor=white)](fastapi-rag/jev_guard.py)
+[![Tests](https://github.com/Kesarwani17/rag-knowledge-assistant-api/actions/workflows/ci.yml/badge.svg)](https://github.com/Kesarwani17/rag-knowledge-assistant-api/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 **Stack:** FastAPI · PostgreSQL + pgvector · Redis · sentence-transformers · Groq (OpenAI-compatible) · Pydantic v2 · Docker
@@ -46,6 +47,8 @@ The API turns tenant-scoped source documents into searchable knowledge and answe
 `ingest -> chunk -> embed + full-text vector -> store -> hybrid retrieve -> rerank -> semantic cache or guarded LLM answer`
 
 The design keeps expensive work explicit: ingestion is asynchronous, retrieval combines dense and sparse signals, reranking narrows context before generation, and Redis can bypass repeated LLM inference.
+
+This project is intentionally built as a learning-oriented reference implementation. The code favors an observable end-to-end flow and explanatory comments so each stage can be followed, tested, and extended before introducing production infrastructure.
 
 ```mermaid
 flowchart TB
@@ -85,6 +88,7 @@ flowchart TB
 - Local CrossEncoder reranking of 15 retrieved candidates before the LLM sees the top 3.
 - Similarity-threshold filtering to reject weak context.
 - Pydantic-validated JSON responses.
+- Explicit response models and bounded request inputs at the API boundary.
 - Explicit hallucination flag for unsupported answers.
 - Source document IDs injected server-side, never trusted from the LLM.
 - Deterministic `temperature=0` generation.
@@ -263,6 +267,34 @@ pytest
 - **Full-text indexing:** stores PostgreSQL `TSVECTOR` values on chunks and declares a GIN index so keyword search does not recompute vectors for every row.
 - **Guard cheap, verify deep:** the optional Jev System-1 guard checks whether the top retrieved context can answer the question before the expensive LLM call; fail-open semantics allow generation to continue when Jev is unavailable or returns malformed data.
 - **Operational simplicity:** PostgreSQL and Redis are the only services required by the local stack; embedding and reranking models run in the API process, while Docker provides the stateful dependencies.
+- **Explicit API contracts:** Pydantic response models make route outputs visible in generated OpenAPI documentation, while input limits prevent unexpectedly large requests from entering the pipeline.
+- **Continuous verification:** GitHub Actions runs the offline test suite on pushes and pull requests.
+
+## Learning scope
+
+The current implementation demonstrates the core RAG pipeline rather than claiming to be a complete production service. Authentication, durable background workers, database migrations, production observability, and real-infrastructure integration tests are intentionally left as follow-up exercises. Tenant handling currently uses the configured demo identity, and Jev remains an optional provisional integration with fail-open behavior.
+
+Suggested progression: understand the existing retrieval and generation flow first, then add one production concern at a time, such as authenticated tenant resolution, integration tests, retrieval evaluation, or durable job processing.
+
+## Code-reading guide
+
+Follow one question through the system in this order:
+
+1. Start at `fastapi-rag/main.py` and read the `/ask` route.
+2. Trace `get_embedding()` into `embeddings.py` to see how the query becomes a vector.
+3. Read `retrieve_chunks()` in `main.py` to compare vector search with PostgreSQL full-text search.
+4. Follow `rerank_chunks()` into `reranker.py` to see how the top context is selected.
+5. Read `semantic_cache.py` to understand how repeated questions can avoid generation.
+6. Read `jev_guard.py` to see the optional answerability check and fail-open error handling.
+7. Finish in `llm.py` to see structured generation, hallucination signaling, and response validation.
+
+Useful learning exercises:
+
+- Change the retrieval limit and observe how the reranker input changes.
+- Add a test for a malformed Jev response and verify that the request still proceeds.
+- Add a typed response model for one currently dictionary-based endpoint.
+- Measure the first `/ask` request against an identical cached request.
+- Add one question to an evaluation dataset and verify its expected source document.
 
 ## Roadmap
 

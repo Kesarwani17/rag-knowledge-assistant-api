@@ -10,7 +10,8 @@ load_dotenv()
 # Groq uses the exact same SDK as OpenAI, we just change the base_url!
 client = OpenAI(
     api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1"
+    base_url="https://api.groq.com/openai/v1",
+    timeout=30.0,
 )
 
 # --- RESUME FLEX: Structured Outputs & Hallucination Guards ---

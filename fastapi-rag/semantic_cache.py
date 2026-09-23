@@ -21,6 +21,8 @@ redis_client = redis.Redis.from_url(
 
 def cosine_similarity(first: list[float], second: list[float]) -> float:
     """Return cosine similarity for two equal-length vectors."""
+    if len(first) != len(second):
+        return 0.0
     dot_product = sum(left * right for left, right in zip(first, second))
     first_norm = math.sqrt(sum(value * value for value in first))
     second_norm = math.sqrt(sum(value * value for value in second))

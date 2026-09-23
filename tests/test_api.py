@@ -102,6 +102,32 @@ def test_create_document_requires_fields():
     assert response.status_code == 422
 
 
+def test_create_document_rejects_oversized_content():
+    """Document input should have a bounded size at the API boundary."""
+    app_module = load_api_without_external_services()
+    response = TestClient(app_module.app).post(
+        "/documents",
+        json={
+            "title": "Large document",
+            "content": "x" * 100_001,
+            "tenant_id": "tenant-a",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_search_rejects_oversized_query():
+    """Search input should have a bounded size at the API boundary."""
+    app_module = load_api_without_external_services()
+    response = TestClient(app_module.app).post(
+        "/search",
+        json={"query": "x" * 1_001},
+    )
+
+    assert response.status_code == 422
+
+
 def test_process_trigger_queues_work_and_reports_processing():
     """Processing should be queued and expose its initial status immediately."""
     app_module = load_api_without_external_services()
