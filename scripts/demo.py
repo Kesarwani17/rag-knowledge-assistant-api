@@ -9,7 +9,7 @@ REQUEST_TIMEOUT = 120
 
 
 def timed_ask(label: str, query: str) -> dict:
-    print(f"\n{'='*64}\n▶ {label}\n  Query: {query!r}\n{'-'*64}")
+    print(f"\n{'='*64}\n>> {label}\n  Query: {query!r}\n{'-'*64}")
     start = time.perf_counter()
     res = requests.post(
         f"{API}/ask",
@@ -19,10 +19,11 @@ def timed_ask(label: str, query: str) -> dict:
     elapsed_ms = (time.perf_counter() - start) * 1000
     res.raise_for_status()
     data = res.json()
-    print(f"  Answer      : {data['answer'][:160]}...")
+    answer = data['answer'][:160].encode('ascii', 'replace').decode('ascii')
+    print(f"  Answer      : {answer}...")
     print(f"  Hallucination: {data['is_hallucination']}")
     print(f"  Sources      : {data['source_document_ids']}")
-    print(f"  ⏱  Latency    : {elapsed_ms:.0f} ms")
+    print(f"  [TIME]  Latency    : {elapsed_ms:.0f} ms")
     return data
 
 
@@ -32,7 +33,7 @@ def main() -> None:
     health = requests.get(f"{API}/health", timeout=REQUEST_TIMEOUT)
     health.raise_for_status()
     assert health.json()["status"] == "ok", "API not healthy"
-    print("✓ API is up\n")
+    print("[OK] API is up\n")
 
     password_query = "How should I store passwords securely?"
 
@@ -65,7 +66,7 @@ def main() -> None:
     assert citation_result["is_hallucination"] is False
     assert citation_result["source_document_ids"]
 
-    print(f"\n{'='*64}\n✅ Demo complete. Stage 2 returned the same response as Stage 1.\n{'='*64}")
+    print(f"\n{'='*64}\n[DONE] Demo complete. Stage 2 returned the same response as Stage 1.\n{'='*64}")
 
 
 if __name__ == "__main__":

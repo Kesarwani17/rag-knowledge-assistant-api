@@ -1,5 +1,6 @@
 """Seed the RAG knowledge base with official OWASP Cheat Sheet documents."""
 import os
+import sys
 import time
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -31,11 +32,27 @@ SOURCE_FILES = [
 ]
 
 
+def _progress_bar(current: int, total: int, prefix: str = "", width: int = 40) -> None:
+    """Print a simple progress bar to stdout."""
+    if total == 0:
+        return
+    pct = current / total
+    filled = int(width * pct)
+    bar = "#" * filled + "-" * (width - filled)
+    sys.stdout.write(f"\r{prefix} [{bar}] {current}/{total} ({pct:.0%})")
+    sys.stdout.flush()
+    if current == total:
+        sys.stdout.write("\n")
+
+
 def load_real_docs() -> list[dict[str, str]]:
     """Download curated source documents from the official OWASP repository."""
     docs = []
-    for filename in SOURCE_FILES:
+    total = len(SOURCE_FILES)
+    print(f"[DOWNLOAD] Downloading {total} OWASP Cheat Sheets...")
+    for i, filename in enumerate(SOURCE_FILES, 1):
         source_url = f"{SOURCE_BASE}/{filename}"
+        _progress_bar(i, total, prefix="  Downloading")
         response = requests.get(source_url, timeout=30)
         response.raise_for_status()
         title = filename.removesuffix(".md").replace("_", " ")
@@ -45,18 +62,26 @@ def load_real_docs() -> list[dict[str, str]]:
             f"{response.text}"
         )
         docs.append({"title": title, "content": content})
+    print(f"[OK] Downloaded {len(docs)} documents")
     return docs
 
 def wait_for(doc_id: int, timeout: int = 180) -> str:
     deadline = time.time() + timeout
+    last_status = ""
+    print(f"  [WAIT] Waiting for doc {doc_id} to complete...", end="", flush=True)
     while time.time() < deadline:
         try:
             status = requests.get(f"{API}/documents/{doc_id}/status").json()["status"]
+            if status != last_status:
+                print(f" {status}", end="", flush=True)
+                last_status = status
             if status in ("completed", "failed"):
+                print(" [OK]")
                 return status
         except Exception:
-            pass
+            print(".", end="", flush=True)
         time.sleep(2)
+    print(" [TIMEOUT]")
     return "timeout"
 
 def process_one(doc: dict, existing_titles: set) -> str:
@@ -76,10 +101,15 @@ def process_one(doc: dict, existing_titles: set) -> str:
         return f"    ERROR: {doc['title']} - {e}"
 
 def main() -> None:
-    print("Checking API connection...")
+    print("[LINK] Checking API connection...")
     try:
+        res = requests.get(f"{API}/health", timeout=5)
+        if res.status_code != 200:
+            print(f"❌ API health check failed: {res.status_code}")
+            return
+        print("[OK] API is reachable")
+
         docs = load_real_docs()
-        print(f"Loaded {len(docs)} official OWASP source documents.")
         res = requests.get(f"{API}/documents")
 
         if res.status_code != 200:
@@ -94,23 +124,38 @@ def main() -> None:
             print(f"Server response: {res.text[:500]}")
             return
 
-        print(f"Found {len(existing_titles)} existing documents. Starting ingestion with {MAX_WORKERS} worker(s)...")
+        new_docs = [d for d in docs if d["title"] not in existing_titles]
+        skipped = len(docs) - len(new_docs)
+        print(f"[STATS] Found {len(existing_titles)} existing, {skipped} skipped, {len(new_docs)} to process")
+        if not new_docs:
+            print("[OK] Nothing new to seed")
+            return
+
+        print(f"[START] Starting ingestion with {MAX_WORKERS} worker(s)...\n")
 
         # Keep the ingestion workload small enough for local PostgreSQL + embedding processing.
+        completed = 0
+        failed = 0
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(process_one, doc, existing_titles) for doc in docs]
+            futures = {executor.submit(process_one, doc, existing_titles): doc for doc in new_docs}
             try:
                 for future in as_completed(futures):
-                    print(future.result())
+                    result = future.result()
+                    completed += 1
+                    if "ERROR" in result or "failed" in result.lower():
+                        failed += 1
+                    print(f"  [{completed}/{len(new_docs)}] {result}")
             except KeyboardInterrupt:
-                print("\nSeed interrupted by user. Stopping gracefully after active jobs were drained or canceled.")
+                print("\n[WARN]  Seed interrupted by user. Stopping gracefully...")
                 for future in futures:
                     if not future.done():
                         future.cancel()
                 raise
 
+        print(f"\n[DONE] Seeding complete: {completed - failed} succeeded, {failed} failed, {skipped} skipped")
+
     except KeyboardInterrupt:
-        print("\nSeeding stopped cleanly. No crash was raised by the application itself.")
+        print("\n[STOP] Seeding stopped cleanly. No crash was raised by the application itself.")
 
 if __name__ == "__main__":
     main()
