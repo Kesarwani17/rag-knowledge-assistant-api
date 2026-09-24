@@ -12,7 +12,18 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL must be set")
 
-engine = create_engine(DATABASE_URL)
+# Connection pool config via env (production-ready defaults)
+POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
+MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=POOL_SIZE,
+    max_overflow=MAX_OVERFLOW,
+    pool_timeout=POOL_TIMEOUT,
+    pool_pre_ping=True,  # validates connections before use
+)
 
 SessionLocal = sessionmaker(
     autocommit=False,

@@ -8,3 +8,5 @@ __pycache__/
 *.db
 dist/
 build/
+.claude/
+CLAUDE.md

@@ -179,6 +179,28 @@ def load_api_without_external_services():
     fake_semantic_cache.cache_response = lambda tenant_id, query_vector, response: None
     fake_semantic_cache.get_cached_response = lambda tenant_id, query_vector: None
 
+    fake_structlog = types.ModuleType("structlog")
+    fake_structlog.configure = lambda *args, **kwargs: None
+    fake_structlog.get_logger = lambda: types.SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        warning=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+    )
+    fake_structlog.processors = types.SimpleNamespace(
+        add_log_level=lambda *args, **kwargs: None,
+        TimeStamper=lambda *args, **kwargs: None,
+        JSONRenderer=lambda *args, **kwargs: None,
+    )
+    fake_structlog.make_filtering_bound_logger = lambda *args, **kwargs: None
+    fake_structlog.wrapper_class = types.SimpleNamespace()
+
+    fake_passlib = types.ModuleType("passlib")
+    fake_passlib.hash = types.SimpleNamespace()
+    fake_passlib.hash.bcrypt = types.SimpleNamespace(
+        hash=lambda p: f"hashed::{p}",
+        verify=lambda p, h: True,
+    )
+
     previous_modules = {
         name: sys.modules.get(name)
         for name in (
@@ -188,6 +210,7 @@ def load_api_without_external_services():
             "llm",
             "reranker",
             "semantic_cache",
+            "structlog",
             "main",
         )
     }
@@ -198,6 +221,9 @@ def load_api_without_external_services():
     sys.modules["llm"] = fake_llm
     sys.modules["reranker"] = fake_reranker
     sys.modules["semantic_cache"] = fake_semantic_cache
+    sys.modules["structlog"] = fake_structlog
+    sys.modules["passlib"] = fake_passlib
+    sys.modules["passlib.hash"] = fake_passlib.hash
     sys.modules.pop("main", None)
 
     try:

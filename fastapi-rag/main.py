@@ -2,16 +2,19 @@
 
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+import logging
+from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
+import structlog
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, text
 
 from llm import generate_answer, RAGResponse
-from database import SessionLocal, init_db
+from database import SessionLocal, init_db, engine
 import models
 from chunking import chunk_text
 from embeddings import get_embedding
@@ -21,10 +24,47 @@ from jev_guard import CONFIDENCE_THRESHOLD, USE_JEV, is_answerable
 
 load_dotenv()
 
+# Structured logging setup
+structlog.configure(
+    processors=[
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+)
+logger = structlog.get_logger()
+
+# Configurable thresholds via env
+SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.35"))
+RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "3"))
+RETRIEVE_LIMIT = int(os.getenv("RETRIEVE_LIMIT", "15"))
+
 init_db()
 
-app = FastAPI(title="RAG Learning API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("app_startup")
+    yield
+    logger.info("app_shutdown")
+
+
+app = FastAPI(title="RAG Learning API", lifespan=lifespan)
 security = HTTPBearer(auto_error=False)
+
+
+# Request size limit middleware (teaches production protection)
+@app.middleware("http")
+async def limit_request_size(request: Request, call_next):
+    max_size = int(os.getenv("MAX_REQUEST_SIZE", "1048576"))  # 1MB default
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > max_size:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"Request body too large (max {max_size} bytes)"},
+        )
+    return await call_next(request)
 
 
 def get_current_tenant_id() -> str:
@@ -33,8 +73,15 @@ def get_current_tenant_id() -> str:
 
 
 def _hash_password(password: str) -> str:
-    """Create a minimal deterministic password hash for demo/admin flows."""
-    return f"hashed::{password}::{len(password)}"
+    """Hash password using bcrypt (production-ready)."""
+    from passlib.hash import bcrypt
+    return bcrypt.hash(password)
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    """Verify password against bcrypt hash."""
+    from passlib.hash import bcrypt
+    return bcrypt.verify(password, password_hash)
 
 
 def _is_valid_token(token_value: str | None) -> bool:
@@ -184,6 +231,35 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/health/ready")
+def health_ready() -> JSONResponse:
+    """Readiness check: verifies DB, Redis, and Groq connectivity."""
+    checks = {"database": False, "redis": False, "groq": False}
+
+    # Check PostgreSQL
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        checks["database"] = True
+    except Exception:
+        logger.warning("health_check_failed", component="database")
+
+    # Check Redis
+    try:
+        from semantic_cache import redis_client
+        redis_client.ping()
+        checks["redis"] = True
+    except Exception:
+        logger.warning("health_check_failed", component="redis")
+
+    # Check Groq (lightweight - just verify key exists)
+    checks["groq"] = bool(os.getenv("GROQ_API_KEY"))
+
+    all_ready = all(checks.values())
+    status_code = 200 if all_ready else 503
+    return JSONResponse(status_code=status_code, content={"ready": all_ready, "checks": checks})
+
+
 @app.post("/admin/organizations", response_model=OrganizationResponse)
 def create_organization(req: OrganizationCreateRequest) -> dict[str, object]:
     """Create a tenant organization for product-style multi-tenancy."""
@@ -227,7 +303,7 @@ def issue_token(req: TokenCreateRequest) -> dict[str, object]:
         if not user or user.organization_id != req.organization_id:
             raise HTTPException(status_code=404, detail="User not found")
 
-        if user.password_hash != _hash_password(req.password):
+        if not _verify_password(req.password, str(user.password_hash)):
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         token_value = f"tenant_{uuid.uuid4().hex}"
@@ -333,7 +409,7 @@ def retrieve_chunks(
     chunk_ids: set[int] = set()
     for chunk, distance in vector_results:
         similarity = 1.0 - float(distance)
-        if similarity >= 0.35:
+        if similarity >= SIMILARITY_THRESHOLD:
             chunks.append({
                 "text": chunk.chunk_text,
                 "document_id": chunk.document_id,
@@ -387,7 +463,7 @@ def process_heavy_document(doc_id: int) -> None:
         if doc:
             doc.status = "failed"
             db.commit()
-        print(f"Error processing doc {doc_id}: {exc}")
+        logger.error("document_processing_failed", doc_id=doc_id, error=str(exc))
     finally:
         db.close()
 
@@ -474,7 +550,7 @@ def ask_question(req: AskQuery) -> RAGResponse:
         if cached_response:
             return cached_response
 
-        chunks, _ = retrieve_chunks(db, req.query, tenant_id, 15, query_embedding)
+        chunks, _ = retrieve_chunks(db, req.query, tenant_id, RETRIEVE_LIMIT, query_embedding)
 
         if not chunks:
             return RAGResponse(
@@ -483,7 +559,7 @@ def ask_question(req: AskQuery) -> RAGResponse:
                 source_document_ids=[]
             )
         # 2. RERANKING: Let the local CrossEncoder select the best context.
-        chunks = rerank_chunks(req.query, chunks)[:3]
+        chunks = rerank_chunks(req.query, chunks)[:RERANK_TOP_K]
 
         if USE_JEV:
             context_text = "\n\n".join(c["text"] for c in chunks)
