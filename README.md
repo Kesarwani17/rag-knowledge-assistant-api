@@ -15,7 +15,7 @@ Production-style retrieval-augmented generation backend with vector search, stru
 [![Tests](https://github.com/Kesarwani17/rag-knowledge-assistant-api/actions/workflows/ci.yml/badge.svg)](https://github.com/Kesarwani17/rag-knowledge-assistant-api/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**Stack:** FastAPI · PostgreSQL + pgvector · Redis · sentence-transformers · Groq (OpenAI-compatible) · Pydantic v2 · Docker
+**Stack:** FastAPI · PostgreSQL + pgvector · Redis · sentence-transformers · Groq (OpenAI-compatible) · Pydantic v2 · Docker · bcrypt · structlog
 
 This repository is a focused backend reference implementation for grounded question answering: documents are ingested into a tenant-scoped knowledge base, retrieved with both semantic and keyword search, reranked locally, and answered with structured LLM output that carries server-verified citations.
 
@@ -85,10 +85,10 @@ flowchart TB
 - Free local embeddings with `all-MiniLM-L6-v2` (384 dimensions; no embedding API cost).
 - Hybrid retrieval combining cosine-similarity search in pgvector with PostgreSQL full-text keyword matching.
 - Exact keyword matching for entities such as error codes and SKUs alongside semantic retrieval.
-- Local CrossEncoder reranking of 15 retrieved candidates before the LLM sees the top 3.
-- Similarity-threshold filtering to reject weak context.
-- Pydantic-validated JSON responses.
-- Explicit response models and bounded request inputs at the API boundary.
+- Local CrossEncoder reranking of retrieved candidates before the LLM sees the top results (configurable via `RERANK_TOP_K`).
+- Configurable similarity-threshold filtering to reject weak context (`SIMILARITY_THRESHOLD`).
+- Pydantic-validated JSON responses with explicit request/response models.
+- Bounded request inputs at the API boundary (configurable `MAX_REQUEST_SIZE`).
 - Explicit hallucination flag for unsupported answers.
 - Source document IDs injected server-side, never trusted from the LLM.
 - Deterministic `temperature=0` generation.
@@ -100,6 +100,11 @@ flowchart TB
 - Persistent ingestion lifecycle states: `pending`, `processing`, `completed`, and `failed`.
 - GIN-indexed PostgreSQL `TSVECTOR` search column populated when chunks are ingested.
 - Reproducible seeding from official OWASP Cheat Sheet Series Markdown documents, with source and license attribution.
+- **Structured JSON logging** via `structlog` with configurable level.
+- **Production-ready password hashing** via bcrypt (replaces demo hash).
+- **Database connection pooling** configurable via `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT`.
+- **Readiness endpoint** (`/health/ready`) verifying DB, Redis, and Groq connectivity.
+- **Configurable retrieval limits** (`RETRIEVE_LIMIT`) and rerank top-K (`RERANK_TOP_K`).
 
 ## Request flow
 
@@ -119,6 +124,7 @@ The guard is disabled by default, so deployments that leave `USE_JEV` unset reta
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | Liveness check |
+| GET | `/health/ready` | Readiness check (DB, Redis, Groq) |
 | POST | `/documents` | Store a source document |
 | GET | `/documents` | List source documents |
 | POST | `/documents/{id}/process` | Queue chunking, embedding, and persistence |
@@ -179,11 +185,22 @@ pip install -r requirements.txt
 Copy-Item .env.example fastapi-rag\.env
 notepad fastapi-rag\.env
 Set-Location fastapi-rag
-uvicorn main:app --reload
+python -m uvicorn main:app --reload
 ```
 
 Add `GROQ_API_KEY`, `DATABASE_URL`, and `REDIS_URL` to `fastapi-rag\.env`, then open <http://127.0.0.1:8000/docs>.
 For the current single-tenant demo configuration, set `USE_MOCK_TENANT=true` and `MOCK_TENANT_ID=acme_corp`. Redis runs locally at `redis://localhost:6379/0` through Docker Compose.
+
+Key environment variables (see `.env.example` for full list):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SIMILARITY_THRESHOLD` | `0.35` | Min cosine similarity for vector results |
+| `RERANK_TOP_K` | `3` | Chunks kept after CrossEncoder rerank |
+| `RETRIEVE_LIMIT` | `15` | Initial candidates before rerank |
+| `DB_POOL_SIZE` | `10` | SQLAlchemy connection pool size |
+| `DB_MAX_OVERFLOW` | `20` | Extra connections above pool size |
+| `MAX_REQUEST_SIZE` | `1048576` | Max request body (1 MB) |
 
 ### Optional Jev configuration
 
@@ -226,9 +243,9 @@ pytest
 ```text
 .
 |-- fastapi-rag/
-|   |-- main.py         # FastAPI routes and request schemas
-|   |-- database.py     # SQLAlchemy engine, sessions, and metadata
-|   |-- models.py       # Document and vector chunk models
+|   |-- main.py         # FastAPI routes, request schemas, pipeline logic
+|   |-- database.py     # SQLAlchemy engine, sessions, metadata, connection pool
+|   |-- models.py       # Document, chunk, org, user, token models
 |   |-- chunking.py     # Overlapping text chunking
 |   |-- embeddings.py   # Local sentence-transformer embeddings
 |   |-- llm.py          # Groq structured generation and guardrails
@@ -269,12 +286,16 @@ pytest
 - **Operational simplicity:** PostgreSQL and Redis are the only services required by the local stack; embedding and reranking models run in the API process, while Docker provides the stateful dependencies.
 - **Explicit API contracts:** Pydantic response models make route outputs visible in generated OpenAPI documentation, while input limits prevent unexpectedly large requests from entering the pipeline.
 - **Continuous verification:** GitHub Actions runs the offline test suite on pushes and pull requests.
+- **Structured logging:** JSON output via `structlog` enables log aggregation and querying.
+- **Secure password storage:** bcrypt via `passlib` replaces the demo hash; `_verify_password` uses constant-time comparison.
+- **Connection pooling:** SQLAlchemy pool sizing via env prevents connection exhaustion under load.
+- **Readiness probing:** `/health/ready` distinguishes liveness from dependency health for container orchestration.
 
 ## Learning scope
 
-The current implementation demonstrates the core RAG pipeline rather than claiming to be a complete production service. Authentication, durable background workers, database migrations, production observability, and real-infrastructure integration tests are intentionally left as follow-up exercises. Tenant handling currently uses the configured demo identity, and Jev remains an optional provisional integration with fail-open behavior.
+The current implementation demonstrates the core RAG pipeline with several production-ready patterns (structured logging, bcrypt, connection pooling, readiness checks, request limits). Authentication uses a token-based demo model; durable background workers, database migrations, distributed tracing, and rate limiting remain as follow-up exercises. Jev is an optional provisional integration with fail-open behavior.
 
-Suggested progression: understand the existing retrieval and generation flow first, then add one production concern at a time, such as authenticated tenant resolution, integration tests, retrieval evaluation, or durable job processing.
+Suggested progression: understand the existing retrieval and generation flow first, then add one production concern at a time, such as authenticated tenant resolution, Alembic migrations, integration tests, retrieval evaluation, or durable job processing.
 
 ## Code-reading guide
 
@@ -288,6 +309,15 @@ Follow one question through the system in this order:
 6. Read `jev_guard.py` to see the optional answerability check and fail-open error handling.
 7. Finish in `llm.py` to see structured generation, hallucination signaling, and response validation.
 
+**Production patterns to study:**
+
+- `database.py`: Connection pool config (`pool_size`, `max_overflow`, `pool_pre_ping`)
+- `main.py:30-50`: Structured logging setup with `structlog`
+- `main.py:75-85`: Bcrypt password hashing and verification
+- `main.py:95-115`: Request size limit middleware
+- `main.py:117-140`: Readiness endpoint checking DB/Redis/Groq
+- `main.py:370-380`: Configurable thresholds via environment variables
+
 Useful learning exercises:
 
 - Change the retrieval limit and observe how the reranker input changes.
@@ -295,6 +325,8 @@ Useful learning exercises:
 - Add a typed response model for one currently dictionary-based endpoint.
 - Measure the first `/ask` request against an identical cached request.
 - Add one question to an evaluation dataset and verify its expected source document.
+- Toggle `SIMILARITY_THRESHOLD` and observe retrieval precision/recall tradeoff.
+- Test `/health/ready` with Redis or PostgreSQL stopped.
 
 ## Roadmap
 
@@ -304,6 +336,9 @@ Useful learning exercises:
 - LangGraph agent mode
 - Redis vector index to replace the current tenant-scoped `SCAN` cache lookup at very large cache sizes
 - Durable background job queue to replace FastAPI in-process `BackgroundTasks`
+- Alembic migrations for schema versioning
+- Rate limiting middleware
+- OpenTelemetry tracing and Prometheus metrics
 
 ## License
 
