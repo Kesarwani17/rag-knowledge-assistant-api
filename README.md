@@ -175,7 +175,7 @@ Example `/search` request:
 
 Prerequisites: Python 3.11+ and Docker Desktop.
 
-From PowerShell:
+### Option A: PowerShell
 
 ```powershell
 docker compose up -d
@@ -185,6 +185,19 @@ pip install -r requirements.txt
 Copy-Item .env.example fastapi-rag\.env
 notepad fastapi-rag\.env
 Set-Location fastapi-rag
+python -m uvicorn main:app --reload
+```
+
+### Option B: cmd (Command Prompt)
+
+```cmd
+docker compose up -d
+python -m venv fastapi-rag\venv
+fastapi-rag\venv\Scripts\activate.bat
+pip install -r requirements.txt
+copy .env.example fastapi-rag\.env
+notepad fastapi-rag\.env
+cd fastapi-rag
 python -m uvicorn main:app --reload
 ```
 
@@ -217,7 +230,13 @@ The request schema in `fastapi-rag/jev_guard.py` is intentionally isolated becau
 
 To seed the database with real public security guidance from the official OWASP Cheat Sheet Series, keep the API running and execute this from the repository root:
 
+**PowerShell:**
 ```powershell
+fastapi-rag\venv\Scripts\python.exe scripts\seed.py
+```
+
+**cmd:**
+```cmd
 fastapi-rag\venv\Scripts\python.exe scripts\seed.py
 ```
 
@@ -225,7 +244,13 @@ The seeder downloads 17 curated OWASP Markdown documents, stores their canonical
 
 To exercise health checks, the full RAG pipeline, semantic caching, hallucination protection, and server-side citations in one run, execute the demo after seeding:
 
+**PowerShell:**
 ```powershell
+fastapi-rag\venv\Scripts\python.exe scripts\demo.py
+```
+
+**cmd:**
+```cmd
 fastapi-rag\venv\Scripts\python.exe scripts\demo.py
 ```
 
@@ -233,9 +258,10 @@ The demo requires the API, PostgreSQL, pgvector, Redis, and `GROQ_API_KEY` to be
 
 Run the test suite from the repository root:
 
-```powershell
+**PowerShell / cmd:**
+```cmd
 pip install -r requirements-dev.txt
-pytest
+python -m pytest -v
 ```
 
 ## Project structure
