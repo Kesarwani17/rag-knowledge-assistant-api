@@ -4,6 +4,11 @@ import os
 import uuid
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+from fastapi import Depends, HTTPException, status
 
 import structlog
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
@@ -43,6 +48,20 @@ RETRIEVE_LIMIT = int(os.getenv("RETRIEVE_LIMIT", "15"))
 init_db()
 
 
+# OpenAPI tag definitions for Swagger UI grouping
+OPENAPI_TAGS = [
+    {"name": "Health", "description": "Service health and readiness checks"},
+    {"name": "Auth - Tokens", "description": "Token issuance (login) and revocation (logout)"},
+    {"name": "Auth - Profile", "description": "Authenticated user profile and context"},
+    {"name": "Admin - Organizations", "description": "Organization management (admin only)"},
+    {"name": "Admin - Users", "description": "User management within organizations"},
+    {"name": "Admin - Tokens", "description": "Admin token utilities (cleanup expired)"},
+    {"name": "Documents", "description": "Document CRUD and background processing"},
+    {"name": "Search", "description": "Hybrid vector + keyword search"},
+    {"name": "RAG", "description": "Full question-answering pipeline with caching and citations"},
+]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("app_startup")
@@ -50,7 +69,11 @@ async def lifespan(app: FastAPI):
     logger.info("app_shutdown")
 
 
-app = FastAPI(title="RAG Learning API", lifespan=lifespan)
+app = FastAPI(
+    title="RAG Learning API",
+    lifespan=lifespan,
+    openapi_tags=OPENAPI_TAGS,
+)
 security = HTTPBearer(auto_error=False)
 
 
@@ -85,13 +108,19 @@ def _verify_password(password: str, password_hash: str) -> bool:
 
 
 def _is_valid_token(token_value: str | None) -> bool:
-    """Return whether the token exists in the product-style auth registry."""
+    """Return whether the token exists and is not expired."""
     if not token_value:
         return False
     db = SessionLocal()
     try:
+        from datetime import datetime, timezone
         token = db.query(models.APIToken).filter(models.APIToken.token == token_value).first()
-        return token is not None
+        if not token:
+            return False
+        # Check expiry
+        if token.expires_at and token.expires_at < datetime.now(timezone.utc):
+            return False
+        return True
     finally:
         db.close()
 
@@ -100,21 +129,98 @@ def get_authenticated_context(
     creds: HTTPAuthorizationCredentials | None = Depends(security),
 ) -> dict[str, object]:
     """Resolve the active tenant and user from a bearer token if one is supplied."""
+    # Mock mode: bypass auth, return fixed tenant context
+    if os.getenv("USE_MOCK_TENANT", "false").lower() == "true":
+        mock_tenant_id = os.getenv("MOCK_TENANT_ID", "default")
+        return {"tenant_id": mock_tenant_id, "user_id": 0, "role": "member"}
+
     if creds is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
 
     token_value = creds.credentials
     if not _is_valid_token(token_value):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired bearer token")
 
     db = SessionLocal()
     try:
+        from datetime import datetime, timezone
         token = db.query(models.APIToken).filter(models.APIToken.token == token_value).first()
         if not token:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
+        # Double-check expiry (defense in depth)
+        if token.expires_at and token.expires_at < datetime.now(timezone.utc):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
         return {"tenant_id": str(token.organization_id), "user_id": token.user_id, "role": token.role}
     finally:
         db.close()
+
+
+def cleanup_expired_tokens() -> int:
+    """Background task: delete expired tokens. Returns count of deleted tokens."""
+    from datetime import datetime, timezone
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        deleted = db.query(models.APIToken).filter(
+            models.APIToken.expires_at.isnot(None),
+            models.APIToken.expires_at < now
+        ).delete()
+        db.commit()
+        logger.info("expired_tokens_cleaned", count=deleted)
+        return deleted
+    finally:
+        db.close()
+
+
+# =============================================================================
+# RBAC System (Simple, Educational)
+# =============================================================================
+class Role(str, Enum):
+    """User roles in the system."""
+    ADMIN = "admin"          # Global admin - can manage all orgs, users, tokens
+    ORG_OWNER = "org_owner"  # Organization owner - can manage users/tokens in their org
+    MEMBER = "member"        # Regular user - can use RAG features, manage own tokens
+
+
+def require_role(*allowed_roles: Role):
+    """Dependency factory: require one of the allowed roles."""
+    def checker(context: dict = Depends(get_authenticated_context)) -> dict:
+        # Bypass RBAC in mock mode
+        if os.getenv("USE_MOCK_TENANT", "false").lower() == "true":
+            return context
+        user_role = Role(context["role"])
+        if user_role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Requires one of: {[r.value for r in allowed_roles]}, got {user_role.value}"
+            )
+        return context
+    return checker
+
+
+def require_org_owner_or_admin(org_id: int):
+    """Dependency factory: require org_owner (for this org) or admin."""
+    def checker(context: dict = Depends(get_authenticated_context)) -> dict:
+        # Bypass RBAC in mock mode
+        if os.getenv("USE_MOCK_TENANT", "false").lower() == "true":
+            return context
+        user_role = Role(context["role"])
+        user_org_id = int(context["tenant_id"])
+        if user_role == Role.ADMIN:
+            return context
+        if user_role == Role.ORG_OWNER and user_org_id == org_id:
+            return context
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requires org_owner for this organization or admin"
+        )
+    return checker
+
+
+# Convenience dependencies (used in route decorators)
+require_admin = require_role(Role.ADMIN)
+require_org_owner_or_admin_any = require_role(Role.ADMIN, Role.ORG_OWNER)
+require_any_authenticated = require_role(Role.ADMIN, Role.ORG_OWNER, Role.MEMBER)
 
 
 class DocumentIn(BaseModel):
@@ -216,6 +322,18 @@ class TokenResponse(BaseModel):
     user_id: int
     organization_id: int
     role: str
+    expires_at: datetime | None = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "token": "tenant_a1b2c3d4e5f6...",
+                "user_id": 1,
+                "organization_id": 1,
+                "role": "admin",
+                "expires_at": "2026-09-26T12:00:00Z"
+            }
+        }
 
 
 class SearchQuery(BaseModel):
@@ -225,13 +343,89 @@ class SearchQuery(BaseModel):
     top_k: int = Field(3, ge=1, le=10)
 
 
-@app.get("/health", response_model=HealthResponse)
+class MeResponse(BaseModel):
+    """Authenticated user's tenant context."""
+
+    tenant_id: str
+    user_id: int
+    role: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "tenant_id": "1",
+                "user_id": 1,
+                "role": "admin"
+            }
+        }
+
+
+class RevokeTokenResponse(BaseModel):
+    """Response after revoking a token (logout)."""
+
+    revoked: bool
+    token_id: int
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "revoked": True,
+                "token_id": 5
+            }
+        }
+
+
+class CleanupTokensResponse(BaseModel):
+    """Response after cleaning up expired tokens."""
+
+    deleted: int
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "deleted": 3
+            }
+        }
+
+
+class ReadyResponse(BaseModel):
+    """Readiness check response with dependency status."""
+
+    ready: bool
+    checks: dict[str, bool]
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "ready": True,
+                "checks": {
+                    "database": True,
+                    "redis": True,
+                    "groq": True
+                }
+            }
+        }
+
+
+@app.get(
+    "/health",
+    response_model=HealthResponse,
+    tags=["Health"],
+    summary="Liveness check",
+    description="Lightweight endpoint to verify the service is running. Returns 200 OK if the app is alive."
+)
 def health() -> dict[str, str]:
     """Return a lightweight liveness response."""
     return {"status": "ok"}
 
 
-@app.get("/health/ready")
+@app.get(
+    "/health/ready",
+    response_model=ReadyResponse,
+    tags=["Health"],
+    summary="Readiness check",
+    description="Verifies all critical dependencies (PostgreSQL, Redis, Groq API) are reachable. Returns 503 if any dependency is down."
+)
 def health_ready() -> JSONResponse:
     """Readiness check: verifies DB, Redis, and Groq connectivity."""
     checks = {"database": False, "redis": False, "groq": False}
@@ -260,7 +454,14 @@ def health_ready() -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"ready": all_ready, "checks": checks})
 
 
-@app.post("/admin/organizations", response_model=OrganizationResponse)
+@app.post(
+    "/admin/organizations",
+    response_model=OrganizationResponse,
+    tags=["Admin - Organizations"],
+    summary="Create organization (admin only)",
+    description="Create a new tenant organization. Requires global admin role.",
+    dependencies=[Depends(require_admin)]
+)
 def create_organization(req: OrganizationCreateRequest) -> dict[str, object]:
     """Create a tenant organization for product-style multi-tenancy."""
     db = SessionLocal()
@@ -275,9 +476,17 @@ def create_organization(req: OrganizationCreateRequest) -> dict[str, object]:
         db.close()
 
 
-@app.post("/admin/users", response_model=UserResponse)
-def create_user(req: UserCreateRequest) -> dict[str, object]:
+@app.post(
+    "/admin/users",
+    response_model=UserResponse,
+    tags=["Admin - Users"],
+    summary="Create user (admin or org_owner for target org)",
+    description="Create a user in an organization. Admin can create in any org; org_owner only in their own org.",
+    dependencies=[Depends(require_org_owner_or_admin_any)]
+)
+def create_user(req: UserCreateRequest, _: dict = Depends(require_org_owner_or_admin(1))) -> dict[str, object]:
     """Create a user and associate them with an organization."""
+    # The dependency factory validates org ownership (admin any, org_owner own org)
     db = SessionLocal()
     try:
         user = models.User(
@@ -294,7 +503,17 @@ def create_user(req: UserCreateRequest) -> dict[str, object]:
         db.close()
 
 
-@app.post("/admin/tokens", response_model=TokenResponse)
+# Token expiry: default 24 hours, configurable via TOKEN_EXPIRY_HOURS (0 = never expires)
+TOKEN_EXPIRY_HOURS = int(os.getenv("TOKEN_EXPIRY_HOURS", "24"))
+
+
+@app.post(
+    "/admin/tokens",
+    response_model=TokenResponse,
+    tags=["Auth - Tokens"],
+    summary="Issue bearer token (login)",
+    description="Authenticate user with email/password and receive a bearer token. Public endpoint (no auth required)."
+)
 def issue_token(req: TokenCreateRequest) -> dict[str, object]:
     """Issue a bearer token for a user in an organization."""
     db = SessionLocal()
@@ -307,31 +526,101 @@ def issue_token(req: TokenCreateRequest) -> dict[str, object]:
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         token_value = f"tenant_{uuid.uuid4().hex}"
+        from datetime import datetime, timezone, timedelta
+        expires_at = None
+        if TOKEN_EXPIRY_HOURS > 0:
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=TOKEN_EXPIRY_HOURS)
         token = models.APIToken(
             token=token_value,
             user_id=user.id,
             organization_id=user.organization_id,
             role=user.role,
+            expires_at=expires_at,
         )
         db.add(token)
         db.commit()
         db.refresh(token)
-        return {"token": token.token, "user_id": token.user_id, "organization_id": token.organization_id, "role": token.role}
+        return {"token": token.token, "user_id": token.user_id, "organization_id": token.organization_id, "role": token.role, "expires_at": token.expires_at}
     finally:
         db.close()
 
 
-@app.get("/me", response_model=dict[str, object])
-def me(context: dict[str, object] = Depends(get_authenticated_context)) -> dict[str, object]:
+@app.delete(
+    "/admin/tokens/{token_id}",
+    response_model=RevokeTokenResponse,
+    tags=["Auth - Tokens"],
+    summary="Revoke token (logout)",
+    description="Revoke a token by ID. Users can revoke their own tokens; admins and org_owners can revoke any token in their organization.",
+    dependencies=[Depends(require_any_authenticated)]
+)
+def revoke_token(token_id: int, context: dict = Depends(get_authenticated_context)) -> dict[str, object]:
+    """Revoke (logout) a token by ID."""
+    db = SessionLocal()
+    try:
+        token = db.query(models.APIToken).filter(models.APIToken.id == token_id).first()
+        if not token:
+            raise HTTPException(status_code=404, detail="Token not found")
+
+        user_role = Role(context["role"])
+        user_id = context["user_id"]
+        user_org_id = int(context["tenant_id"])
+
+        # Allow: own token, admin (any), org_owner (same org)
+        if user_id == token.user_id:
+            pass  # own token
+        elif user_role == Role.ADMIN:
+            pass  # admin can revoke any
+        elif user_role == Role.ORG_OWNER and user_org_id == token.organization_id:
+            pass  # org_owner can revoke in their org
+        else:
+            raise HTTPException(status_code=403, detail="Not authorized to revoke this token")
+
+        db.delete(token)
+        db.commit()
+        return {"revoked": True, "token_id": token_id}
+    finally:
+        db.close()
+
+
+@app.post(
+    "/admin/tokens/cleanup",
+    response_model=CleanupTokensResponse,
+    tags=["Admin - Tokens"],
+    summary="Clean up expired tokens (admin only)",
+    description="Manually trigger cleanup of all expired tokens. Requires admin role.",
+    dependencies=[Depends(require_admin)]
+)
+def cleanup_tokens_endpoint() -> dict[str, object]:
+    """Manually trigger expired token cleanup (admin only)."""
+    deleted = cleanup_expired_tokens()
+    return {"deleted": deleted}
+
+
+@app.get(
+    "/me",
+    response_model=MeResponse,
+    tags=["Auth - Profile"],
+    summary="Get current user profile",
+    description="Returns the authenticated user's tenant context (tenant_id, user_id, role). Requires valid bearer token.",
+    dependencies=[Depends(require_any_authenticated)]
+)
+def me(context: dict = Depends(get_authenticated_context)) -> dict[str, object]:
     """Return the authenticated user's tenant context."""
     return {"tenant_id": context["tenant_id"], "user_id": context["user_id"], "role": context["role"]}
 
 
-@app.post("/documents", response_model=DocumentResponse)
+@app.post(
+    "/documents",
+    response_model=DocumentResponse,
+    tags=["Documents"],
+    summary="Create document",
+    description="Store a source document in the knowledge base. Requires authentication.",
+    dependencies=[Depends(require_any_authenticated)]
+)
 def create_document(doc: DocumentIn) -> dict[str, object]:
     """Store a source document and return its generated identifier."""
     db = SessionLocal()
-    
+
     use_mock_tenant = os.getenv("USE_MOCK_TENANT", "false").lower() == "true"
     if use_mock_tenant:
         tenant_id = os.getenv("MOCK_TENANT_ID")
@@ -350,7 +639,14 @@ def create_document(doc: DocumentIn) -> dict[str, object]:
         db.close()
 
 
-@app.get("/documents", response_model=list[DocumentDetailResponse])
+@app.get(
+    "/documents",
+    response_model=list[DocumentDetailResponse],
+    tags=["Documents"],
+    summary="List documents",
+    description="List all source documents for the current tenant. Requires authentication.",
+    dependencies=[Depends(require_any_authenticated)]
+)
 def list_documents() -> list[dict[str, object]]:
     """Return all stored source documents."""
     db = SessionLocal()
@@ -468,7 +764,14 @@ def process_heavy_document(doc_id: int) -> None:
         db.close()
 
 
-@app.post("/documents/{doc_id}/process", response_model=ProcessResponse)
+@app.post(
+    "/documents/{doc_id}/process",
+    response_model=ProcessResponse,
+    tags=["Documents"],
+    summary="Process document (trigger embedding)",
+    description="Queue document chunking and embedding as a background task. Requires authentication.",
+    dependencies=[Depends(require_any_authenticated)]
+)
 def trigger_process(doc_id: int, background_tasks: BackgroundTasks) -> dict[str, object]:
     """Queue document processing and return before embedding work begins."""
     db = SessionLocal()
@@ -502,7 +805,14 @@ def trigger_process(doc_id: int, background_tasks: BackgroundTasks) -> dict[str,
         db.close()
 
 
-@app.get("/documents/{doc_id}/status", response_model=StatusResponse)
+@app.get(
+    "/documents/{doc_id}/status",
+    response_model=StatusResponse,
+    tags=["Documents"],
+    summary="Get document processing status",
+    description="Check the status of a document's background processing (pending/processing/completed/failed). Requires authentication.",
+    dependencies=[Depends(require_any_authenticated)]
+)
 def get_document_status(doc_id: int) -> dict[str, object]:
     """Return the current background processing status for a document."""
     db = SessionLocal()
@@ -523,7 +833,14 @@ def get_document_status(doc_id: int) -> dict[str, object]:
         db.close()
 
 
-@app.post("/search", response_model=list[ChunkResponse])
+@app.post(
+    "/search",
+    response_model=list[ChunkResponse],
+    tags=["Search"],
+    summary="Hybrid search (vector + keyword)",
+    description="Combine dense vector (pgvector) and sparse keyword (PostgreSQL full-text) retrieval. Requires authentication.",
+    dependencies=[Depends(require_any_authenticated)]
+)
 def search_documents(req: SearchQuery) -> list[dict[str, object]]:
     """Combine dense vector and sparse keyword retrieval for a query."""
     db = SessionLocal()
@@ -539,7 +856,14 @@ class AskQuery(BaseModel):
 
     query: str = Field(..., min_length=1, max_length=1_000)
 
-@app.post("/ask", response_model=RAGResponse)
+@app.post(
+    "/ask",
+    response_model=RAGResponse,
+    tags=["RAG"],
+    summary="Ask a question (full RAG pipeline)",
+    description="Retrieve context, check semantic cache, optionally use JEV guard, generate structured answer with citations. Requires authentication.",
+    dependencies=[Depends(require_any_authenticated)]
+)
 def ask_question(req: AskQuery) -> RAGResponse:
     """Retrieve, rerank, and generate a grounded answer from relevant chunks."""
     db = SessionLocal()

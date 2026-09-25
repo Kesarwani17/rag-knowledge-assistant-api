@@ -1,6 +1,7 @@
 """API contract tests that avoid PostgreSQL, embeddings, and external LLM calls."""
 
 import importlib
+import os
 import sys
 import types
 from pathlib import Path
@@ -23,6 +24,9 @@ class FakeRAGResponse(BaseModel):
 
 def load_api_without_external_services():
     """Import the FastAPI app with database and model dependencies stubbed."""
+    # Disable mock tenant mode for tests to verify auth behavior
+    os.environ["USE_MOCK_TENANT"] = "false"
+
     class FakeConnection:
         """Context manager replacing the import-time SQLAlchemy connection."""
 
@@ -69,12 +73,13 @@ def load_api_without_external_services():
     class FakeAPIToken:
         token = FakeColumn("token")
 
-        def __init__(self, token=None, user_id=None, organization_id=None, role="member"):
+        def __init__(self, token=None, user_id=None, organization_id=None, role="member", expires_at=None):
             self.id = None
             self.token = token
             self.user_id = user_id
             self.organization_id = organization_id
             self.role = role
+            self.expires_at = expires_at
 
     class FakeQuery:
         """Minimal query object used by the tenant auth routes."""
@@ -201,6 +206,15 @@ def load_api_without_external_services():
         verify=lambda p, h: True,
     )
 
+    # Add a fake admin token to the shared session so admin routes work
+    admin_token = FakeAPIToken(token="admin_test_token", user_id=1, organization_id=1, role="admin")
+    admin_token.id = 1
+    shared_session.tokens.append(admin_token)
+    # Also add a fake user for that token
+    admin_user = FakeUser(email="admin@test.com", password_hash="hashed::secret", organization_id=1, role="admin")
+    admin_user.id = 1
+    shared_session.users.append(admin_user)
+
     previous_modules = {
         name: sys.modules.get(name)
         for name in (
@@ -247,13 +261,15 @@ def test_health_endpoint_returns_ok():
 def test_create_document_requires_fields():
     """Document creation should reject a body missing required fields."""
     app_module = load_api_without_external_services()
-    response = TestClient(app_module.app).post("/documents", json={})
+    headers = {"Authorization": "Bearer admin_test_token"}
+    response = TestClient(app_module.app).post("/documents", json={}, headers=headers)
     assert response.status_code == 422
 
 
 def test_create_document_rejects_oversized_content():
     """Document input should have a bounded size at the API boundary."""
     app_module = load_api_without_external_services()
+    headers = {"Authorization": "Bearer admin_test_token"}
     response = TestClient(app_module.app).post(
         "/documents",
         json={
@@ -261,6 +277,7 @@ def test_create_document_rejects_oversized_content():
             "content": "x" * 100_001,
             "tenant_id": "tenant-a",
         },
+        headers=headers,
     )
 
     assert response.status_code == 422
@@ -269,9 +286,11 @@ def test_create_document_rejects_oversized_content():
 def test_search_rejects_oversized_query():
     """Search input should have a bounded size at the API boundary."""
     app_module = load_api_without_external_services()
+    headers = {"Authorization": "Bearer admin_test_token"}
     response = TestClient(app_module.app).post(
         "/search",
         json={"query": "x" * 1_001},
+        headers=headers,
     )
 
     assert response.status_code == 422
@@ -336,9 +355,12 @@ def test_admin_can_create_organization_and_issue_token():
     """The admin bootstrap flow should create an organization and issue a tenant-scoped token."""
     app_module = load_api_without_external_services()
 
+    headers = {"Authorization": "Bearer admin_test_token"}
+
     org_response = TestClient(app_module.app).post(
         "/admin/organizations",
         json={"name": "Acme Health"},
+        headers=headers,
     )
     assert org_response.status_code == 200
     assert org_response.json()["name"] == "Acme Health"
@@ -351,6 +373,7 @@ def test_admin_can_create_organization_and_issue_token():
             "organization_id": 1,
             "role": "admin",
         },
+        headers=headers,
     )
     assert user_response.status_code == 200
     assert user_response.json()["email"] == "alice@acme.com"
@@ -368,11 +391,23 @@ def test_protected_route_requires_valid_bearer_token():
     """Protected tenant-scoped routes should reject missing or invalid bearer tokens."""
     app_module = load_api_without_external_services()
 
+    # Test without token - should fail
     response = TestClient(app_module.app).get("/me")
     assert response.status_code == 401
 
+    # Test with invalid token - should fail
     response = TestClient(app_module.app).get(
         "/me",
         headers={"Authorization": "Bearer invalid-token"},
     )
     assert response.status_code == 401
+
+    # Test with valid admin token - should succeed
+    response = TestClient(app_module.app).get(
+        "/me",
+        headers={"Authorization": "Bearer admin_test_token"},
+    )
+    assert response.status_code == 200
+    assert response.json()["tenant_id"] == "1"
+    assert response.json()["user_id"] == 1
+    assert response.json()["role"] == "admin"

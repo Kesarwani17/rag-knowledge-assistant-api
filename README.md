@@ -105,6 +105,8 @@ flowchart TB
 - **Database connection pooling** configurable via `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT`.
 - **Readiness endpoint** (`/health/ready`) verifying DB, Redis, and Groq connectivity.
 - **Configurable retrieval limits** (`RETRIEVE_LIMIT`) and rerank top-K (`RERANK_TOP_K`).
+- **Token-based authentication** with bcrypt, configurable expiry (`TOKEN_EXPIRY_HOURS`), and revocation (logout).
+- **Multi-tenant isolation** via Organization → User → APIToken hierarchy with `tenant_id` on every row.
 
 ## Request flow
 
@@ -125,6 +127,12 @@ The guard is disabled by default, so deployments that leave `USE_JEV` unset reta
 |---|---|---|
 | GET | `/health` | Liveness check |
 | GET | `/health/ready` | Readiness check (DB, Redis, Groq) |
+| GET | `/me` | Current user's tenant context (requires Bearer token) |
+| POST | `/admin/organizations` | Create a tenant organization |
+| POST | `/admin/users` | Create a user in an organization |
+| POST | `/admin/tokens` | Issue a bearer token (login) |
+| DELETE | `/admin/tokens/{token_id}` | Revoke a token (logout) |
+| POST | `/admin/tokens/cleanup` | Clean up expired tokens (admin only) |
 | POST | `/documents` | Store a source document |
 | GET | `/documents` | List source documents |
 | POST | `/documents/{id}/process` | Queue chunking, embedding, and persistence |
@@ -214,6 +222,7 @@ Key environment variables (see `.env.example` for full list):
 | `DB_POOL_SIZE` | `10` | SQLAlchemy connection pool size |
 | `DB_MAX_OVERFLOW` | `20` | Extra connections above pool size |
 | `MAX_REQUEST_SIZE` | `1048576` | Max request body (1 MB) |
+| `TOKEN_EXPIRY_HOURS` | `24` | Token lifetime in hours (0 = never expires) |
 
 ### Optional Jev configuration
 
@@ -316,6 +325,8 @@ python -m pytest -v
 - **Secure password storage:** bcrypt via `passlib` replaces the demo hash; `_verify_password` uses constant-time comparison.
 - **Connection pooling:** SQLAlchemy pool sizing via env prevents connection exhaustion under load.
 - **Readiness probing:** `/health/ready` distinguishes liveness from dependency health for container orchestration.
+- **Token authentication with expiry & revocation:** Bearer tokens (`tenant_{uuid}`) stored in DB with configurable TTL (`TOKEN_EXPIRY_HOURS`), validated on each request, revocable via `DELETE /admin/tokens/{id}` (logout), with background cleanup of expired tokens.
+- **Multi-tenant hierarchy:** `Organization` → `User` → `APIToken` chain; every data row carries `tenant_id` for isolation; `role` column enables future RBAC.
 
 ## Learning scope
 
