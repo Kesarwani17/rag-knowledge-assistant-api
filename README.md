@@ -48,7 +48,7 @@ The API turns tenant-scoped source documents into searchable knowledge and answe
 
 The design keeps expensive work explicit: ingestion is asynchronous, retrieval combines dense and sparse signals, reranking narrows context before generation, and Redis can bypass repeated LLM inference.
 
-This project is intentionally built as a learning-oriented reference implementation. The code favors an observable end-to-end flow and explanatory comments so each stage can be followed, tested, and extended before introducing production infrastructure.
+The implementation keeps the RAG flow observable while enforcing tenant boundaries at the API and database query layers.
 
 ```mermaid
 flowchart TB
@@ -93,6 +93,7 @@ flowchart TB
 - Source document IDs injected server-side, never trusted from the LLM.
 - Deterministic `temperature=0` generation.
 - Background-task ingestion with a status endpoint for long-running embedding workloads.
+- Tenant-scoped document update and delete; updates clear old chunks and return the document to `pending` for reprocessing.
 - Redis semantic caching with cosine similarity to bypass duplicate LLM calls.
 - Optional Jev System-1 answerability guard (feature-flagged, fail-open) refuses out-of-scope queries before LLM generation.
 - Tenant-scoped retrieval and cache isolation through `tenant_id`.
@@ -105,8 +106,12 @@ flowchart TB
 - **Database connection pooling** configurable via `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT`.
 - **Readiness endpoint** (`/health/ready`) verifying DB, Redis, and Groq connectivity.
 - **Configurable retrieval limits** (`RETRIEVE_LIMIT`) and rerank top-K (`RERANK_TOP_K`).
-- **Token-based authentication** with bcrypt, configurable expiry (`TOKEN_EXPIRY_HOURS`), and revocation (logout).
+- **Token-based authentication** with SHA-256 bearer-token hashes, bcrypt password hashes, configurable expiry (`TOKEN_EXPIRY_HOURS`), and revocation (logout).
+- Bearer tokens are stored as SHA-256 hashes; raw tokens are returned only when issued.
+- Tenant-scoped fixed-window rate limits on `/documents`, `/search`, and `/ask`.
 - **Multi-tenant isolation** via Organization → User → APIToken hierarchy with `tenant_id` on every row.
+
+On startup, `init_db()` migrates existing `api_tokens` rows by hashing their bearer tokens with SHA-256, then removes the legacy plaintext `token` column. Back up the database before upgrading; downgrading to a version that expects plaintext tokens requires restoring that backup.
 
 ## Request flow
 
@@ -135,6 +140,8 @@ The guard is disabled by default, so deployments that leave `USE_JEV` unset reta
 | POST | `/admin/tokens/cleanup` | Clean up expired tokens (admin only) |
 | POST | `/documents` | Store a source document |
 | GET | `/documents` | List source documents |
+| PUT | `/documents/{id}` | Replace source content, clear chunks, and mark pending |
+| DELETE | `/documents/{id}` | Delete a document and its chunks |
 | POST | `/documents/{id}/process` | Queue chunking, embedding, and persistence |
 | GET | `/documents/{id}/status` | Check whether processing is `pending`, `processing`, `completed`, or `failed` |
 | POST | `/search` | Retrieve hybrid semantic and keyword matches |
@@ -163,12 +170,13 @@ Example `/documents` request:
 ```json
 {
   "title": "Return Policy",
-  "content": "Returns are accepted within 30 days.",
-  "tenant_id": "acme_corp"
+  "content": "Returns are accepted within 30 days."
 }
 ```
 
-In the current demo configuration, set `USE_MOCK_TENANT=true` and `MOCK_TENANT_ID=acme_corp` to use one tenant for document creation and retrieval. Otherwise, `tenant_id` from the request is stored for the document, while reads use `MOCK_TENANT_ID` as the active tenant. Production authentication should replace this configuration with the tenant from the request identity.
+The API ignores extra `tenant_id` fields. In normal mode (`USE_MOCK_TENANT=false`), it resolves the tenant from the bearer token and never accepts a client-selected tenant. `USE_MOCK_TENANT=true` is a development-only authentication bypass that assigns every request the configured `MOCK_TENANT_ID`.
+
+`POST /admin/tokens` issues an opaque bearer token. The raw value is returned once; only its SHA-256 hash is stored. Login failures for unknown users and incorrect passwords both return `401 Invalid credentials`. Only admins can create admins or organization owners; organization owners can create members only in their own organization. Other tenants' document IDs return 404 for status, processing, update, and delete routes.
 
 Example `/search` request:
 
@@ -222,6 +230,8 @@ Key environment variables (see `.env.example` for full list):
 | `DB_POOL_SIZE` | `10` | SQLAlchemy connection pool size |
 | `DB_MAX_OVERFLOW` | `20` | Extra connections above pool size |
 | `MAX_REQUEST_SIZE` | `1048576` | Max request body (1 MB) |
+| `RATE_LIMIT_REQUESTS` | `60` | Requests per tenant, route, and fixed window |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Fixed-window duration |
 | `TOKEN_EXPIRY_HOURS` | `24` | Token lifetime in hours (0 = never expires) |
 
 ### Optional Jev configuration
@@ -265,13 +275,24 @@ fastapi-rag\venv\Scripts\python.exe scripts\demo.py
 
 The demo requires the API, PostgreSQL, pgvector, Redis, and `GROQ_API_KEY` to be available. Stage 2 repeats the exact Stage 1 query so the semantic-cache assertion is deterministic. A previous run may already have cached Stage 1, so its label describes the expected pipeline rather than guaranteeing a cache miss.
 
-Run the test suite from the repository root:
+Run unit/API tests from the repository root:
 
 **PowerShell / cmd:**
 ```cmd
 pip install -r requirements-dev.txt
-python -m pytest -v
+python -m pytest -q -m "not integration"
 ```
+
+Run real PostgreSQL/pgvector and Redis integration tests with Docker services:
+
+```powershell
+docker compose up -d postgres redis
+$env:DATABASE_URL = "postgresql+psycopg2://postgres:postgres@localhost:5432/ragdb"
+$env:REDIS_URL = "redis://localhost:6379/0"
+python -m pytest -q -m integration
+```
+
+Integration tests use a unique PostgreSQL schema and tenant IDs per test, real Redis, deterministic vectors, and no Groq calls. CI provisions the same services and runs unit and integration markers separately.
 
 ## Project structure
 
@@ -314,25 +335,25 @@ python -m pytest -v
 - **Persistent job status:** stores ingestion state on the document row so status remains consistent across workers and process restarts; failures are recorded as `failed`.
 - **Hybrid search:** combines dense embeddings for semantic meaning with sparse PostgreSQL full-text matching for exact entities such as `ERR-4042`.
 - **Reranking:** expands `/ask` retrieval to 15 candidates, then uses a local CrossEncoder to select the 3 most relevant context chunks for generation.
-- **Semantic caching:** stores query embeddings and validated answers in Redis for one hour; a cosine similarity above `0.95` returns the cached answer without calling Groq.
-- **Tenant isolation:** uses one resolved tenant ID for retrieval, document listing/status/processing checks, and Redis cache namespaces, preventing cross-tenant results and cache leaks; production authentication should replace the current demo tenant configuration.
+- **Semantic caching:** stores query embeddings and validated answers in Redis for one hour; a cosine similarity above `0.95` returns a recent cached answer without calling Groq. Lookup compares at most the newest 200 entries per tenant and corpus version; older paraphrases can miss the cache and trigger generation. A Redis vector index is the next step if cache volume outgrows this bounded list.
+- **Tenant isolation:** derives tenant IDs from authenticated context and scopes document/chunk reads and writes by both document ID and tenant ID.
 - **Full-text indexing:** stores PostgreSQL `TSVECTOR` values on chunks and declares a GIN index so keyword search does not recompute vectors for every row.
 - **Guard cheap, verify deep:** the optional Jev System-1 guard checks whether the top retrieved context can answer the question before the expensive LLM call; fail-open semantics allow generation to continue when Jev is unavailable or returns malformed data.
 - **Operational simplicity:** PostgreSQL and Redis are the only services required by the local stack; embedding and reranking models run in the API process, while Docker provides the stateful dependencies.
 - **Explicit API contracts:** Pydantic response models make route outputs visible in generated OpenAPI documentation, while input limits prevent unexpectedly large requests from entering the pipeline.
-- **Continuous verification:** GitHub Actions runs the offline test suite on pushes and pull requests.
+- **Continuous verification:** GitHub Actions runs unit tests and real Postgres/Redis integration tests on pushes and pull requests.
 - **Structured logging:** JSON output via `structlog` enables log aggregation and querying.
 - **Secure password storage:** bcrypt via `passlib` replaces the demo hash; `_verify_password` uses constant-time comparison.
 - **Connection pooling:** SQLAlchemy pool sizing via env prevents connection exhaustion under load.
 - **Readiness probing:** `/health/ready` distinguishes liveness from dependency health for container orchestration.
-- **Token authentication with expiry & revocation:** Bearer tokens (`tenant_{uuid}`) stored in DB with configurable TTL (`TOKEN_EXPIRY_HOURS`), validated on each request, revocable via `DELETE /admin/tokens/{id}` (logout), with background cleanup of expired tokens.
-- **Multi-tenant hierarchy:** `Organization` → `User` → `APIToken` chain; every data row carries `tenant_id` for isolation; `role` column enables future RBAC.
+- **Token authentication with expiry & revocation:** Random bearer tokens are SHA-256 hashed at rest, validated by hash, expire according to `TOKEN_EXPIRY_HOURS`, and can be revoked via `DELETE /admin/tokens/{id}`.
+- **Multi-tenant hierarchy:** `Organization` → `User` → `APIToken`; documents and chunks carry `tenant_id`, while authentication rows are scoped by `organization_id` and role.
 
-## Learning scope
+## Security
 
-The current implementation demonstrates the core RAG pipeline with several production-ready patterns (structured logging, bcrypt, connection pooling, readiness checks, request limits). Authentication uses a token-based demo model; durable background workers, database migrations, distributed tracing, and rate limiting remain as follow-up exercises. Jev is an optional provisional integration with fail-open behavior.
+Covered: token hash-at-rest and legacy-column migration; bcrypt password verification; generic login failures; role/organization authorization; tenant-scoped document and chunk access; request body limits including chunked requests; fixed-window rate limits; Redis cache tenant/version isolation; server-derived citations.
 
-Suggested progression: understand the existing retrieval and generation flow first, then add one production concern at a time, such as authenticated tenant resolution, Alembic migrations, integration tests, retrieval evaluation, or durable job processing.
+Known limits: rate limiting and cache invalidation fail open when Redis is unavailable; the rate limit is per tenant and route, not per user/token; the recent-answer index retains at most 200 entries per tenant/version, so older equivalent questions may miss; ingestion uses in-process `BackgroundTasks`; JEV remains an optional provisional fail-open integration. Back up the database before startup migrates existing plaintext tokens.
 
 ## Code-reading guide
 
@@ -351,7 +372,7 @@ Follow one question through the system in this order:
 - `database.py`: Connection pool config (`pool_size`, `max_overflow`, `pool_pre_ping`)
 - `main.py:30-50`: Structured logging setup with `structlog`
 - `main.py:75-85`: Bcrypt password hashing and verification
-- `main.py:95-115`: Request size limit middleware
+- `main.py`: Request body limit and rate-limit dependencies
 - `main.py:117-140`: Readiness endpoint checking DB/Redis/Groq
 - `main.py:370-380`: Configurable thresholds via environment variables
 
@@ -371,10 +392,9 @@ Useful learning exercises:
 - Golden evaluation dataset
 - Multi-tenant metadata filters
 - LangGraph agent mode
-- Redis vector index to replace the current tenant-scoped `SCAN` cache lookup at very large cache sizes
+- Redis vector index to replace the bounded recent-entry list at very large cache sizes
 - Durable background job queue to replace FastAPI in-process `BackgroundTasks`
 - Alembic migrations for schema versioning
-- Rate limiting middleware
 - OpenTelemetry tracing and Prometheus metrics
 
 ## License

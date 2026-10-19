@@ -13,13 +13,14 @@ if not DATABASE_URL:
 
 engine = create_engine(DATABASE_URL)
 
+
 def init_db() -> None:
     """Enable pgvector and verify that PostgreSQL accepts a connection."""
     with engine.connect() as conn:
-        # This command activates the vector database capabilities
-        conn.execute(text('CREATE EXTENSION IF NOT EXISTS vector;'))
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
         conn.commit()
     print("SUCCESS: Connected to PostgreSQL and pgvector extension is enabled!")
+
 
 if __name__ == "__main__":
     init_db()

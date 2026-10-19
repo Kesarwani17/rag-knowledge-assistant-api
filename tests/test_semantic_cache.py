@@ -1,7 +1,6 @@
 """Offline tests for Redis semantic cache matching and serialization."""
 
 import sys
-from fnmatch import fnmatch
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parents[1] / "fastapi-rag"
@@ -17,9 +16,11 @@ class FakeRedis:
     def __init__(self):
         self.values = {}
         self.counters = {}
+        self.lists = {}
+        self.expirations = {}
 
     def scan_iter(self, match):
-        return (key for key in self.values if fnmatch(key, match))
+        raise AssertionError("Cache lookup must use its bounded Redis list")
 
     def get(self, key):
         return self.counters.get(key, self.values.get(key))
@@ -30,6 +31,19 @@ class FakeRedis:
     def incr(self, key):
         self.counters[key] = self.counters.get(key, 0) + 1
         return self.counters[key]
+
+    def lrange(self, key, start, end):
+        return self.lists.get(key, [])[start:end + 1]
+
+    def lpush(self, key, value):
+        self.lists.setdefault(key, []).insert(0, value)
+
+    def ltrim(self, key, start, end):
+        self.lists[key] = self.lists.get(key, [])[start:end + 1]
+
+    def expire(self, key, seconds):
+        self.expirations[key] = seconds
+        return True
 
 
 def test_cache_returns_response_above_similarity_threshold(monkeypatch):
@@ -92,6 +106,28 @@ def test_cache_response_uses_captured_corpus_version(monkeypatch):
     semantic_cache.cache_response("tenant-a", [1.0, 0.0], response, corpus_version=0)
     semantic_cache.bump_corpus_version("tenant-a")
 
+    assert semantic_cache.get_cached_response("tenant-a", [1.0, 0.0]) is None
+
+
+def test_cache_lookup_is_limited_to_recent_entries(monkeypatch):
+    """Old cache entries outside the per-version cap are no longer searched."""
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(semantic_cache, "redis_client", fake_redis)
+    semantic_cache.cache_response(
+        "tenant-a",
+        [1.0, 0.0],
+        RAGResponse(answer="old", is_hallucination=False),
+    )
+    for index in range(semantic_cache.CACHE_MAX_ENTRIES):
+        semantic_cache.cache_response(
+            "tenant-a",
+            [0.0, 1.0],
+            RAGResponse(answer=f"recent-{index}", is_hallucination=False),
+        )
+
+    index_key = semantic_cache._cache_index_key("tenant-a", 0)
+    assert len(fake_redis.lists[index_key]) == semantic_cache.CACHE_MAX_ENTRIES
+    assert fake_redis.expirations[index_key] == semantic_cache.CACHE_TTL_SECONDS
     assert semantic_cache.get_cached_response("tenant-a", [1.0, 0.0]) is None
 
 

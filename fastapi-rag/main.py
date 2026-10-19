@@ -3,6 +3,7 @@
 import os
 import uuid
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
@@ -11,11 +12,12 @@ from typing import Optional
 from fastapi import Depends, HTTPException, status
 
 import structlog
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from dotenv import load_dotenv
+from redis.exceptions import RedisError
 from sqlalchemy import desc, func, select, text
 
 from llm import generate_answer, RAGResponse
@@ -29,8 +31,10 @@ from semantic_cache import (
     cache_response,
     get_cached_response,
     get_corpus_version,
+    redis_client,
 )
 from jev_guard import CONFIDENCE_THRESHOLD, USE_JEV, is_answerable
+from token_security import hash_token
 
 load_dotenv()
 
@@ -49,6 +53,9 @@ logger = structlog.get_logger()
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.35"))
 RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "3"))
 RETRIEVE_LIMIT = int(os.getenv("RETRIEVE_LIMIT", "15"))
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "60"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+MAX_REQUEST_SIZE = int(os.getenv("MAX_REQUEST_SIZE", "1048576"))
 
 init_db()
 
@@ -82,17 +89,60 @@ app = FastAPI(
 security = HTTPBearer(auto_error=False)
 
 
-# Request size limit middleware (teaches production protection)
-@app.middleware("http")
-async def limit_request_size(request: Request, call_next):
-    max_size = int(os.getenv("MAX_REQUEST_SIZE", "1048576"))  # 1MB default
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > max_size:
-        return JSONResponse(
+class RequestSizeLimitMiddleware:
+    """Reject request bodies that exceed the configured limit while reading."""
+
+    def __init__(self, app, max_size: int):
+        self.app = app
+        self.max_size = max_size
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers", []))
+        content_length = headers.get(b"content-length")
+        if content_length:
+            try:
+                if int(content_length) > self.max_size:
+                    await self._reject(scope, receive, send)
+                    return
+            except ValueError:
+                pass
+
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            body.extend(message.get("body", b""))
+            if len(body) > self.max_size:
+                await self._reject(scope, receive, send)
+                return
+            if not message.get("more_body", False):
+                break
+
+        body_sent = False
+
+        async def replay_body():
+            nonlocal body_sent
+            if body_sent:
+                return {"type": "http.disconnect"}
+            body_sent = True
+            return {"type": "http.request", "body": bytes(body), "more_body": False}
+
+        await self.app(scope, replay_body, send)
+
+    async def _reject(self, scope, receive, send):
+        response = JSONResponse(
             status_code=413,
-            content={"detail": f"Request body too large (max {max_size} bytes)"},
+            content={"detail": f"Request body too large (max {self.max_size} bytes)"},
         )
-    return await call_next(request)
+        await response(scope, receive, send)
+
+
+app.add_middleware(RequestSizeLimitMiddleware, max_size=MAX_REQUEST_SIZE)
 
 
 def _hash_password(password: str) -> str:
@@ -107,6 +157,9 @@ def _verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.verify(password, password_hash)
 
 
+DUMMY_PASSWORD_HASH = _hash_password("invalid-login-dummy-password")
+
+
 def _is_valid_token(token_value: str | None) -> bool:
     """Return whether the token exists and is not expired."""
     if not token_value:
@@ -114,7 +167,7 @@ def _is_valid_token(token_value: str | None) -> bool:
     db = SessionLocal()
     try:
         from datetime import datetime, timezone
-        token = db.query(models.APIToken).filter(models.APIToken.token == token_value).first()
+        token = db.query(models.APIToken).filter(models.APIToken.token_hash == hash_token(token_value)).first()
         if not token:
             return False
         # Check expiry
@@ -144,7 +197,7 @@ def get_authenticated_context(
     db = SessionLocal()
     try:
         from datetime import datetime, timezone
-        token = db.query(models.APIToken).filter(models.APIToken.token == token_value).first()
+        token = db.query(models.APIToken).filter(models.APIToken.token_hash == hash_token(token_value)).first()
         if not token:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid bearer token")
         # Double-check expiry (defense in depth)
@@ -173,7 +226,7 @@ def cleanup_expired_tokens() -> int:
 
 
 # =============================================================================
-# RBAC System (Simple, Educational)
+# Role-based authorization
 # =============================================================================
 class Role(str, Enum):
     """User roles in the system."""
@@ -224,6 +277,38 @@ def _check_org_owner_or_admin(context: dict, org_id: int) -> dict:
 require_admin = require_role(Role.ADMIN)
 require_org_owner_or_admin_any = require_role(Role.ADMIN, Role.ORG_OWNER)
 require_any_authenticated = require_role(Role.ADMIN, Role.ORG_OWNER, Role.MEMBER)
+
+
+def enforce_rate_limit(context: dict, route: str) -> None:
+    """Apply a tenant-scoped Redis fixed-window request limit."""
+    if RATE_LIMIT_REQUESTS <= 0 or RATE_LIMIT_WINDOW_SECONDS <= 0:
+        return
+
+    now = int(time.time())
+    window = RATE_LIMIT_WINDOW_SECONDS
+    window_id = now // window
+    key = f"rag:rate-limit:{context['tenant_id']}:{route}:{window_id}"
+    try:
+        request_count = redis_client.incr(key)
+        redis_client.expire(key, window)
+    except RedisError:
+        logger.warning("rate_limit_redis_unavailable", tenant_id=context["tenant_id"], route=route)
+        return
+
+    if request_count > RATE_LIMIT_REQUESTS:
+        retry_after = max(1, window - now % window)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def require_rate_limit(route: str):
+    """Dependency factory for per-tenant route rate limits."""
+    def checker(context: dict = Depends(get_authenticated_context)) -> None:
+        enforce_rate_limit(context, route)
+    return checker
 
 
 class DocumentIn(BaseModel):
@@ -297,7 +382,7 @@ class UserCreateRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=255)
     password: str = Field(..., min_length=6, max_length=200)
     organization_id: int = Field(..., ge=1)
-    role: str = Field(default="member", min_length=1, max_length=64)
+    role: Role = Role.MEMBER
 
 
 class UserResponse(BaseModel):
@@ -326,8 +411,8 @@ class TokenResponse(BaseModel):
     role: str
     expires_at: datetime | None = None
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "token": "tenant_a1b2c3d4e5f6...",
                 "user_id": 1,
@@ -336,6 +421,7 @@ class TokenResponse(BaseModel):
                 "expires_at": "2026-09-26T12:00:00Z"
             }
         }
+    )
 
 
 class SearchQuery(BaseModel):
@@ -352,14 +438,15 @@ class MeResponse(BaseModel):
     user_id: int
     role: str
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "tenant_id": "1",
                 "user_id": 1,
                 "role": "admin"
             }
         }
+    )
 
 
 class RevokeTokenResponse(BaseModel):
@@ -368,13 +455,14 @@ class RevokeTokenResponse(BaseModel):
     revoked: bool
     token_id: int
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "revoked": True,
                 "token_id": 5
             }
         }
+    )
 
 
 class CleanupTokensResponse(BaseModel):
@@ -382,12 +470,13 @@ class CleanupTokensResponse(BaseModel):
 
     deleted: int
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "deleted": 3
             }
         }
+    )
 
 
 class ReadyResponse(BaseModel):
@@ -396,8 +485,8 @@ class ReadyResponse(BaseModel):
     ready: bool
     checks: dict[str, bool]
 
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "ready": True,
                 "checks": {
@@ -407,6 +496,7 @@ class ReadyResponse(BaseModel):
                 }
             }
         }
+    )
 
 
 @app.get(
@@ -488,15 +578,22 @@ def create_organization(req: OrganizationCreateRequest) -> dict[str, object]:
 )
 def create_user(req: UserCreateRequest, context: dict = Depends(get_authenticated_context)) -> dict[str, object]:
     """Create a user and associate them with an organization."""
-    if os.getenv("USE_MOCK_TENANT", "false").lower() != "true":
+    mock_tenant = os.getenv("USE_MOCK_TENANT", "false").lower() == "true"
+    caller_role = Role(context["role"])
+    if not mock_tenant:
         _check_org_owner_or_admin(context, req.organization_id)
+    if req.role != Role.MEMBER and caller_role != Role.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can create admin or org_owner users",
+        )
     db = SessionLocal()
     try:
         user = models.User(
             email=req.email.strip().lower(),
             password_hash=_hash_password(req.password),
             organization_id=req.organization_id,
-            role=req.role,
+            role=req.role.value,
         )
         db.add(user)
         db.commit()
@@ -522,8 +619,9 @@ def issue_token(req: TokenCreateRequest) -> dict[str, object]:
     db = SessionLocal()
     try:
         user = db.query(models.User).filter(models.User.email == req.email.strip().lower()).first()
-        if not user or user.organization_id != req.organization_id:
-            raise HTTPException(status_code=404, detail="User not found")
+        if user is None or int(user.organization_id) != req.organization_id:
+            _verify_password(req.password, DUMMY_PASSWORD_HASH)
+            raise HTTPException(status_code=401, detail="Invalid credentials")
 
         if not _verify_password(req.password, str(user.password_hash)):
             raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -534,7 +632,7 @@ def issue_token(req: TokenCreateRequest) -> dict[str, object]:
         if TOKEN_EXPIRY_HOURS > 0:
             expires_at = datetime.now(timezone.utc) + timedelta(hours=TOKEN_EXPIRY_HOURS)
         token = models.APIToken(
-            token=token_value,
+            token_hash=hash_token(token_value),
             user_id=user.id,
             organization_id=user.organization_id,
             role=user.role,
@@ -543,7 +641,7 @@ def issue_token(req: TokenCreateRequest) -> dict[str, object]:
         db.add(token)
         db.commit()
         db.refresh(token)
-        return {"token": token.token, "user_id": token.user_id, "organization_id": token.organization_id, "role": token.role, "expires_at": token.expires_at}
+        return {"token": token_value, "user_id": token.user_id, "organization_id": token.organization_id, "role": token.role, "expires_at": token.expires_at}
     finally:
         db.close()
 
@@ -618,7 +716,7 @@ def me(context: dict = Depends(get_authenticated_context)) -> dict[str, object]:
     tags=["Documents"],
     summary="Create document",
     description="Store a source document in the knowledge base. Requires authentication.",
-    dependencies=[Depends(require_any_authenticated)]
+    dependencies=[Depends(require_any_authenticated), Depends(require_rate_limit("documents"))]
 )
 def create_document(doc: DocumentIn, context: dict = Depends(get_authenticated_context)) -> dict[str, object]:
     """Store a source document and return its generated identifier."""
@@ -642,7 +740,7 @@ def create_document(doc: DocumentIn, context: dict = Depends(get_authenticated_c
     tags=["Documents"],
     summary="List documents",
     description="List all source documents for the current tenant. Requires authentication.",
-    dependencies=[Depends(require_any_authenticated)]
+    dependencies=[Depends(require_any_authenticated), Depends(require_rate_limit("documents-list"))]
 )
 def list_documents(context: dict = Depends(get_authenticated_context)) -> list[dict[str, object]]:
     """Return all stored source documents."""
@@ -655,6 +753,81 @@ def list_documents(context: dict = Depends(get_authenticated_context)) -> list[d
             .all()
         )
         return [{"id": d.id, "title": d.title, "content": d.content} for d in docs]
+    finally:
+        db.close()
+
+
+@app.put(
+    "/documents/{doc_id}",
+    response_model=DocumentResponse,
+    tags=["Documents"],
+    summary="Update document",
+    description="Update a tenant-owned document and queue it for reprocessing.",
+    dependencies=[Depends(require_any_authenticated), Depends(require_rate_limit("documents"))]
+)
+def update_document(
+    doc_id: int,
+    doc_update: DocumentIn,
+    context: dict = Depends(get_authenticated_context),
+) -> dict[str, object]:
+    """Replace a document's source and clear chunks generated from old content."""
+    tenant_id = str(context["tenant_id"])
+    db = SessionLocal()
+    try:
+        doc = db.query(models.Document).filter(
+            models.Document.id == doc_id,
+            models.Document.tenant_id == tenant_id,
+        ).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+        if doc.status == "processing":
+            raise HTTPException(status_code=409, detail="Document is currently processing")
+
+        db.query(models.DocumentChunk).filter(
+            models.DocumentChunk.document_id == doc_id,
+            models.DocumentChunk.tenant_id == tenant_id,
+        ).delete(synchronize_session=False)
+        doc.title = doc_update.title
+        doc.content = doc_update.content
+        doc.status = "pending"
+        db.commit()
+        bump_corpus_version(tenant_id)
+        return {"id": doc.id, "title": doc.title, "status": doc.status}
+    finally:
+        db.close()
+
+
+@app.delete(
+    "/documents/{doc_id}",
+    response_model=DocumentResponse,
+    tags=["Documents"],
+    summary="Delete document",
+    description="Delete a tenant-owned document and its chunks.",
+    dependencies=[Depends(require_any_authenticated), Depends(require_rate_limit("documents"))]
+)
+def delete_document(doc_id: int, context: dict = Depends(get_authenticated_context)) -> dict[str, object]:
+    """Delete a document and all of its tenant-owned chunks."""
+    tenant_id = str(context["tenant_id"])
+    db = SessionLocal()
+    try:
+        doc = db.query(models.Document).filter(
+            models.Document.id == doc_id,
+            models.Document.tenant_id == tenant_id,
+        ).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found")
+        if doc.status == "processing":
+            raise HTTPException(status_code=409, detail="Document is currently processing")
+
+        response = {"id": doc.id, "title": doc.title, "status": "deleted"}
+        db.query(models.DocumentChunk).filter(
+            models.DocumentChunk.document_id == doc_id,
+            models.DocumentChunk.tenant_id == tenant_id,
+        ).delete(synchronize_session=False)
+        db.delete(doc)
+        db.commit()
+        bump_corpus_version(tenant_id)
+        return response
     finally:
         db.close()
 
@@ -773,7 +946,7 @@ def process_heavy_document(doc_id: int, tenant_id: str) -> None:
     tags=["Documents"],
     summary="Process document (trigger embedding)",
     description="Queue document chunking and embedding as a background task. Requires authentication.",
-    dependencies=[Depends(require_any_authenticated)]
+    dependencies=[Depends(require_any_authenticated), Depends(require_rate_limit("documents-process"))]
 )
 def trigger_process(
     doc_id: int,
@@ -818,7 +991,7 @@ def trigger_process(
     tags=["Documents"],
     summary="Get document processing status",
     description="Check the status of a document's background processing (pending/processing/completed/failed). Requires authentication.",
-    dependencies=[Depends(require_any_authenticated)]
+    dependencies=[Depends(require_any_authenticated), Depends(require_rate_limit("documents-status"))]
 )
 def get_document_status(doc_id: int, context: dict = Depends(get_authenticated_context)) -> dict[str, object]:
     """Return the current background processing status for a document."""
@@ -846,7 +1019,7 @@ def get_document_status(doc_id: int, context: dict = Depends(get_authenticated_c
     tags=["Search"],
     summary="Hybrid search (vector + keyword)",
     description="Combine dense vector (pgvector) and sparse keyword (PostgreSQL full-text) retrieval. Requires authentication.",
-    dependencies=[Depends(require_any_authenticated)]
+    dependencies=[Depends(require_any_authenticated), Depends(require_rate_limit("search"))]
 )
 def search_documents(
     req: SearchQuery,
@@ -872,7 +1045,7 @@ class AskQuery(BaseModel):
     tags=["RAG"],
     summary="Ask a question (full RAG pipeline)",
     description="Retrieve context, check semantic cache, optionally use JEV guard, generate structured answer with citations. Requires authentication.",
-    dependencies=[Depends(require_any_authenticated)]
+    dependencies=[Depends(require_any_authenticated), Depends(require_rate_limit("ask"))]
 )
 def ask_question(req: AskQuery, context: dict = Depends(get_authenticated_context)) -> RAGResponse:
     """Retrieve, rerank, and generate a grounded answer from relevant chunks."""
@@ -909,8 +1082,7 @@ def ask_question(req: AskQuery, context: dict = Depends(get_authenticated_contex
         # 3. GENERATION: Send only the top 3 chunks to Groq with guardrails
         llm_response = generate_answer(req.query, chunks)
 
-        # --- SENIOR FIX: Force the correct IDs from the database ---
-        # Don't rely on the LLM to remember IDs. We inject the exact ones we retrieved.
+        # Derive citation IDs from retrieved database rows, not model output.
         llm_response.source_document_ids = list(set(c["document_id"] for c in chunks))
         if corpus_version is not None and get_corpus_version(tenant_id) == corpus_version:
             cache_response(

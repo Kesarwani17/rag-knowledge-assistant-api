@@ -1,6 +1,7 @@
 """API contract tests that avoid PostgreSQL, embeddings, and external LLM calls."""
 
 import importlib
+import hashlib
 import os
 import sys
 import types
@@ -71,6 +72,9 @@ def load_api_without_external_services():
             self.status = "pending"
 
     class FakeDocumentChunk:
+        document_id = FakeColumn("document_id")
+        tenant_id = FakeColumn("tenant_id")
+
         def __init__(self, document_id=None, chunk_index=None, chunk_text=None,
                      embedding=None, tenant_id=None, search_vector=None):
             self.id = None
@@ -93,11 +97,11 @@ def load_api_without_external_services():
             self.role = role
 
     class FakeAPIToken:
-        token = FakeColumn("token")
+        token_hash = FakeColumn("token_hash")
 
-        def __init__(self, token=None, user_id=None, organization_id=None, role="member", expires_at=None):
+        def __init__(self, token_hash=None, user_id=None, organization_id=None, role="member", expires_at=None):
             self.id = None
-            self.token = token
+            self.token_hash = token_hash
             self.user_id = user_id
             self.organization_id = organization_id
             self.role = role
@@ -122,6 +126,13 @@ def load_api_without_external_services():
         def all(self):
             records = self.session.records(self.model)
             return [record for record in records if self._matches(record)]
+
+        def delete(self, synchronize_session=False):
+            records = self.session.records(self.model)
+            matching_records = [record for record in records if self._matches(record)]
+            for record in matching_records:
+                records.remove(record)
+            return len(matching_records)
 
         def _matches(self, record):
             for predicate in self._filters:
@@ -187,8 +198,24 @@ def load_api_without_external_services():
                 if obj.id is None:
                     obj.id = len(self.documents)
 
+        def delete(self, obj):
+            self.records(type(obj)).remove(obj)
+
         def close(self):
             return None
+
+    class FakeRateLimitRedis:
+        def __init__(self):
+            self.counters = {}
+            self.expirations = {}
+
+        def incr(self, key):
+            self.counters[key] = self.counters.get(key, 0) + 1
+            return self.counters[key]
+
+        def expire(self, key, seconds):
+            self.expirations[key] = seconds
+            return True
 
     shared_session = FakeSession()
 
@@ -216,6 +243,7 @@ def load_api_without_external_services():
     fake_semantic_cache.get_cached_response = lambda tenant_id, query_vector: None
     fake_semantic_cache.bump_corpus_version = lambda tenant_id: None
     fake_semantic_cache.get_corpus_version = lambda tenant_id: 0
+    fake_semantic_cache.redis_client = FakeRateLimitRedis()
 
     fake_structlog = types.ModuleType("structlog")
     fake_structlog.configure = lambda *args, **kwargs: None
@@ -240,7 +268,12 @@ def load_api_without_external_services():
     )
 
     # Add a fake admin token to the shared session so admin routes work
-    admin_token = FakeAPIToken(token="admin_test_token", user_id=1, organization_id=1, role="admin")
+    admin_token = FakeAPIToken(
+        token_hash=hashlib.sha256(b"admin_test_token").hexdigest(),
+        user_id=1,
+        organization_id=1,
+        role="admin",
+    )
     admin_token.id = 1
     shared_session.tokens.append(admin_token)
     # Also add a fake user for that token
@@ -314,6 +347,25 @@ def test_create_document_rejects_oversized_content():
     )
 
     assert response.status_code == 422
+
+
+def test_chunked_request_body_exceeding_limit_returns_413(monkeypatch):
+    """The body limit applies while receiving chunked payloads without Content-Length."""
+    monkeypatch.setenv("MAX_REQUEST_SIZE", "128")
+    app_module = load_api_without_external_services()
+    chunks = iter([b'{"title":"large","content":"', b"x" * 256, b'"}'])
+
+    response = TestClient(app_module.app).post(
+        "/documents",
+        content=chunks,
+        headers={
+            "Authorization": "Bearer admin_test_token",
+            "Content-Type": "application/json",
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+    assert response.status_code == 413
 
 
 def test_search_rejects_oversized_query():
@@ -442,7 +494,11 @@ def test_admin_can_create_organization_and_issue_token():
     )
     assert token_response.status_code == 200
     assert token_response.json()["organization_id"] == 1
-    assert token_response.json()["token"]
+    raw_token = token_response.json()["token"]
+    assert raw_token
+    stored_token = app_module.SessionLocal().tokens[-1]
+    assert stored_token.token_hash == app_module.hash_token(raw_token)
+    assert not hasattr(stored_token, "token")
 
 
 def test_protected_route_requires_valid_bearer_token():
@@ -488,7 +544,7 @@ def add_test_token(app_module, token_value, organization_id, role="member"):
     session.add(user)
     session.commit()
     token = app_module.models.APIToken(
-        token=token_value,
+        token_hash=app_module.hash_token(token_value),
         user_id=user.id,
         organization_id=organization_id,
         role=role,
@@ -528,12 +584,20 @@ def test_documents_and_search_are_isolated_between_authenticated_tenants():
 
     status_response = client.get(f"/documents/{document_id}/status", headers=tenant_b)
     process_response = client.post(f"/documents/{document_id}/process", headers=tenant_b)
+    update_response = client.put(
+        f"/documents/{document_id}",
+        json={"title": "Changed", "content": "unauthorized update"},
+        headers=tenant_b,
+    )
+    delete_response = client.delete(f"/documents/{document_id}", headers=tenant_b)
     assert status_response.status_code == 404
     assert process_response.status_code == 404
+    assert update_response.status_code == 404
+    assert delete_response.status_code == 404
 
 
-def test_ask_cache_is_tenant_isolated_and_document_creation_invalidates(monkeypatch):
-    """Identical questions stay tenant-scoped and a corpus change expires old answers."""
+def test_ask_cache_is_tenant_isolated_and_document_update_invalidates(monkeypatch):
+    """Updating a tenant's source invalidates its old answer and permits reprocessing."""
     app_module = load_api_without_external_services()
     client = TestClient(app_module.app)
     tenant_a = add_test_token(app_module, "tenant-a-token", 1)
@@ -563,21 +627,73 @@ def test_ask_cache_is_tenant_isolated_and_document_creation_invalidates(monkeypa
         tenant_id, versions[tenant_id] + 1
     )
 
+    created = client.post(
+        "/documents",
+        json={"title": "Original source", "content": "A before update"},
+        headers=tenant_a,
+    )
+    document_id = created.json()["id"]
+
     answer_a = client.post("/ask", json={"query": "same question"}, headers=tenant_a)
     answer_b = client.post("/ask", json={"query": "same question"}, headers=tenant_b)
     assert answer_a.json()["answer"] == "A before update"
     assert answer_b.json()["answer"] == "B answer"
 
     corpus_answers["1"] = "A after update"
-    added = client.post(
-        "/documents",
-        json={"title": "Updated source", "content": "new tenant A source"},
+    updated = client.put(
+        f"/documents/{document_id}",
+        json={"title": "Updated source", "content": "A after update"},
         headers=tenant_a,
     )
-    assert added.status_code == 200
+    assert updated.status_code == 200
+    assert updated.json()["status"] == "pending"
 
     updated_answer = client.post("/ask", json={"query": "same question"}, headers=tenant_a)
     assert updated_answer.json()["answer"] == "A after update"
+
+    reprocess = client.post(f"/documents/{document_id}/process", headers=tenant_a)
+    assert reprocess.status_code == 200
+
+
+def test_delete_document_removes_chunks_from_search(monkeypatch):
+    """Deleting a document removes its tenant-owned chunks from search results."""
+    app_module = load_api_without_external_services()
+    client = TestClient(app_module.app)
+    tenant_a = add_test_token(app_module, "tenant-a-token", 1)
+    document_response = client.post(
+        "/documents",
+        json={"title": "To delete", "content": "searchable content"},
+        headers=tenant_a,
+    )
+    document_id = document_response.json()["id"]
+    session = app_module.SessionLocal()
+    chunk = app_module.models.DocumentChunk(
+        document_id=document_id,
+        chunk_index=0,
+        chunk_text="searchable content",
+        embedding=[1.0],
+        tenant_id="1",
+    )
+    session.add(chunk)
+    session.commit()
+    app_module.retrieve_chunks = lambda db, query, tenant_id, limit, query_embedding=None: (
+        [
+            {"text": item.chunk_text, "document_id": item.document_id, "similarity_score": 1.0}
+            for item in session.chunks
+            if item.tenant_id == tenant_id
+        ],
+        [],
+    )
+
+    before = client.post("/search", json={"query": "searchable"}, headers=tenant_a)
+    deleted = client.delete(f"/documents/{document_id}", headers=tenant_a)
+    after = client.post("/search", json={"query": "searchable"}, headers=tenant_a)
+
+    assert before.json()
+    assert deleted.status_code == 200
+    assert deleted.json()["status"] == "deleted"
+    assert session.chunks == []
+    assert after.json() == []
 
 
 def test_ask_does_not_cache_answer_when_corpus_changes_during_generation(monkeypatch):
@@ -630,3 +746,127 @@ def test_org_owner_cannot_create_user_in_another_org_but_admin_can():
     assert forbidden.status_code == 403
     assert created.status_code == 200
     assert created.json()["organization_id"] == 1
+
+
+def test_user_creation_role_authorization_rules():
+    """Only admins may assign privileged roles; invalid roles fail validation."""
+    app_module = load_api_without_external_services()
+    client = TestClient(app_module.app)
+    owner = add_test_token(app_module, "org-two-owner", 2, "org_owner")
+    admin = {"Authorization": "Bearer admin_test_token"}
+
+    def create_user(email, role, headers):
+        return client.post(
+            "/admin/users",
+            json={
+                "email": email,
+                "password": "secret123",
+                "organization_id": 2,
+                "role": role,
+            },
+            headers=headers,
+        )
+
+    owner_admin = create_user("owner-admin@example.com", "admin", owner)
+    owner_member = create_user("owner-member@example.com", "member", owner)
+    unknown_role = create_user("unknown-role@example.com", "superuser", owner)
+    admin_admin = create_user("admin-admin@example.com", "admin", admin)
+
+    assert owner_admin.status_code == 403
+    assert owner_member.status_code == 200
+    assert owner_member.json()["role"] == "member"
+    assert unknown_role.status_code == 422
+    assert admin_admin.status_code == 200
+    assert admin_admin.json()["role"] == "admin"
+
+
+def test_document_rate_limit_returns_retry_after(monkeypatch):
+    """Tenant document writes are rejected after the configured fixed-window cap."""
+    app_module = load_api_without_external_services()
+    client = TestClient(app_module.app)
+    monkeypatch.setattr(app_module, "RATE_LIMIT_REQUESTS", 2)
+    monkeypatch.setattr(app_module, "RATE_LIMIT_WINDOW_SECONDS", 60)
+    headers = {"Authorization": "Bearer admin_test_token"}
+
+    responses = [
+        client.post(
+            "/documents",
+            json={"title": f"Doc {index}", "content": "content"},
+            headers=headers,
+        )
+        for index in range(3)
+    ]
+    tenant_b = add_test_token(app_module, "tenant-b-token", 2)
+    other_tenant_response = client.post(
+        "/documents",
+        json={"title": "Other tenant document", "content": "content"},
+        headers=tenant_b,
+    )
+
+    assert [response.status_code for response in responses] == [200, 200, 429]
+    assert int(responses[-1].headers["Retry-After"]) > 0
+    assert other_tenant_response.status_code == 200
+
+
+def test_search_and_ask_rate_limits(monkeypatch):
+    """Search and ask use independent tenant-scoped fixed-window limits."""
+    app_module = load_api_without_external_services()
+    client = TestClient(app_module.app)
+    monkeypatch.setattr(app_module, "RATE_LIMIT_REQUESTS", 1)
+    monkeypatch.setattr(app_module, "RATE_LIMIT_WINDOW_SECONDS", 60)
+    app_module.get_embedding = lambda query: [1.0, 0.0]
+    app_module.retrieve_chunks = lambda db, query, tenant_id, limit, query_embedding=None: ([], [1.0, 0.0])
+    headers = {"Authorization": "Bearer admin_test_token"}
+
+    for path in ("/search", "/ask"):
+        responses = [
+            client.post(path, json={"query": "question"}, headers=headers)
+            for _ in range(2)
+        ]
+        assert [response.status_code for response in responses] == [200, 429]
+        assert responses[-1].headers.get("Retry-After")
+
+
+def test_rate_limit_fails_open_when_redis_is_unavailable(monkeypatch):
+    """Redis errors must not make authenticated API requests unavailable."""
+    app_module = load_api_without_external_services()
+
+    class UnavailableRedis:
+        def incr(self, key):
+            raise app_module.RedisError("connection unavailable")
+
+    monkeypatch.setattr(app_module, "redis_client", UnavailableRedis())
+    response = TestClient(app_module.app).post(
+        "/documents",
+        json={"title": "Available", "content": "content"},
+        headers={"Authorization": "Bearer admin_test_token"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_login_unknown_user_and_wrong_password_have_identical_responses(monkeypatch):
+    """Missing accounts use dummy bcrypt verification and share the login error."""
+    app_module = load_api_without_external_services()
+    client = TestClient(app_module.app)
+    verified_hashes = []
+
+    def verify_password(password, password_hash):
+        verified_hashes.append(password_hash)
+        return False
+
+    monkeypatch.setattr(app_module, "_verify_password", verify_password)
+    app_module.SessionLocal().users[0].password_hash = "correct-password-hash"
+
+    unknown_user = client.post(
+        "/admin/tokens",
+        json={"email": "missing@example.com", "password": "incorrect", "organization_id": 1},
+    )
+    wrong_password = client.post(
+        "/admin/tokens",
+        json={"email": "admin@test.com", "password": "incorrect", "organization_id": 1},
+    )
+
+    assert unknown_user.status_code == wrong_password.status_code == 401
+    assert unknown_user.json() == wrong_password.json() == {"detail": "Invalid credentials"}
+    assert verified_hashes == [app_module.DUMMY_PASSWORD_HASH, "correct-password-hash"]

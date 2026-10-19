@@ -51,7 +51,7 @@ class APIToken(Base):
     __tablename__ = "api_tokens"
 
     id = Column(Integer, primary_key=True, index=True)
-    token = Column(String(255), nullable=False, unique=True, index=True)
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
     user_id = Column(Integer, nullable=False, index=True)
     organization_id = Column(Integer, nullable=False, index=True)
     role = Column(String(64), nullable=False, default="member", server_default="member")

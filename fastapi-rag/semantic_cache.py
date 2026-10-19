@@ -14,6 +14,7 @@ CACHE_PREFIX = "rag:semantic-cache:"
 CACHE_VERSION_PREFIX = "rag:corpus-version:"
 CACHE_TTL_SECONDS = 3600
 SIMILARITY_THRESHOLD = 0.95
+CACHE_MAX_ENTRIES = 200
 logger = logging.getLogger(__name__)
 
 redis_client = redis.Redis.from_url(
@@ -43,11 +44,12 @@ def get_corpus_version(tenant_id: str) -> int | None:
         return None
 
 
-def _cache_namespace(tenant_id: str, corpus_version: int | None = None) -> str:
-    version = corpus_version if corpus_version is not None else get_corpus_version(tenant_id)
-    if version is None:
-        raise redis.RedisError("Unable to read tenant corpus version")
-    return f"{CACHE_PREFIX}{tenant_id}:{version}:"
+def _cache_namespace(tenant_id: str, corpus_version: int) -> str:
+    return f"{CACHE_PREFIX}{tenant_id}:{corpus_version}:"
+
+
+def _cache_index_key(tenant_id: str, corpus_version: int) -> str:
+    return f"{_cache_namespace(tenant_id, corpus_version)}recent"
 
 
 def bump_corpus_version(tenant_id: str) -> None:
@@ -61,8 +63,14 @@ def bump_corpus_version(tenant_id: str) -> None:
 def get_cached_response(tenant_id: str, query_vector: list[float]) -> RAGResponse | None:
     """Return the closest cached response when similarity exceeds the threshold."""
     try:
-        cache_namespace = _cache_namespace(tenant_id)
-        for key in redis_client.scan_iter(match=f"{cache_namespace}*"):
+        corpus_version = get_corpus_version(tenant_id)
+        if corpus_version is None:
+            return None
+        for key in redis_client.lrange(
+            _cache_index_key(tenant_id, corpus_version),
+            0,
+            CACHE_MAX_ENTRIES - 1,
+        ):
             cached = redis_client.get(key)
             if not cached:
                 continue
@@ -87,10 +95,20 @@ def cache_response(
         "response": response.model_dump(),
     }
     try:
+        if corpus_version is None:
+            corpus_version = get_corpus_version(tenant_id)
+        if corpus_version is None:
+            return
+
+        cache_key = f"{_cache_namespace(tenant_id, corpus_version)}{uuid4().hex}"
         redis_client.set(
-            f"{_cache_namespace(tenant_id, corpus_version)}{uuid4().hex}",
+            cache_key,
             json.dumps(payload),
             ex=CACHE_TTL_SECONDS,
         )
+        index_key = _cache_index_key(tenant_id, corpus_version)
+        redis_client.lpush(index_key, cache_key)
+        redis_client.ltrim(index_key, 0, CACHE_MAX_ENTRIES - 1)
+        redis_client.expire(index_key, CACHE_TTL_SECONDS)
     except (redis.RedisError, TypeError, ValueError):
         return

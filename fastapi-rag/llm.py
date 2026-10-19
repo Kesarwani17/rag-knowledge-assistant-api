@@ -7,13 +7,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Groq uses the exact same SDK as OpenAI, we just change the base_url!
-client = OpenAI(
-    api_key=os.getenv("GROQ_API_KEY"),
-    base_url="https://api.groq.com/openai/v1",
-    timeout=30.0,
-)
-
 # --- RESUME FLEX: Structured Outputs & Hallucination Guards ---
 class RAGResponse(BaseModel):
     """Validated answer payload returned by the guarded LLM call."""
@@ -25,6 +18,12 @@ class RAGResponse(BaseModel):
 
 def generate_answer(query: str, context_chunks: list[dict]) -> RAGResponse:
     """Generate a schema-validated answer using only retrieved context chunks."""
+    client = OpenAI(
+        api_key=os.getenv("GROQ_API_KEY"),
+        base_url="https://api.groq.com/openai/v1",
+        timeout=30.0,
+    )
+
     # Format the retrieved chunks into a single text block
     context_text = "\n\n".join([
         f"[Doc ID {c['document_id']}]: {c['text']}" for c in context_chunks
