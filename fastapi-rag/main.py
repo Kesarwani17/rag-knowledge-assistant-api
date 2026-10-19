@@ -24,7 +24,12 @@ import models
 from chunking import chunk_text
 from embeddings import get_embedding
 from reranker import rerank_chunks
-from semantic_cache import cache_response, get_cached_response
+from semantic_cache import (
+    bump_corpus_version,
+    cache_response,
+    get_cached_response,
+    get_corpus_version,
+)
 from jev_guard import CONFIDENCE_THRESHOLD, USE_JEV, is_answerable
 
 load_dotenv()
@@ -88,11 +93,6 @@ async def limit_request_size(request: Request, call_next):
             content={"detail": f"Request body too large (max {max_size} bytes)"},
         )
     return await call_next(request)
-
-
-def get_current_tenant_id() -> str:
-    """Return the configured tenant identifier for the current deployment."""
-    return os.getenv("MOCK_TENANT_ID", "default")
 
 
 def _hash_password(password: str) -> str:
@@ -204,17 +204,20 @@ def require_org_owner_or_admin(org_id: int):
         # Bypass RBAC in mock mode
         if os.getenv("USE_MOCK_TENANT", "false").lower() == "true":
             return context
-        user_role = Role(context["role"])
-        user_org_id = int(context["tenant_id"])
-        if user_role == Role.ADMIN:
-            return context
-        if user_role == Role.ORG_OWNER and user_org_id == org_id:
-            return context
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Requires org_owner for this organization or admin"
-        )
+        return _check_org_owner_or_admin(context, org_id)
     return checker
+
+
+def _check_org_owner_or_admin(context: dict, org_id: int) -> dict:
+    """Authorize admins globally and organization owners within their own org."""
+    user_role = Role(context["role"])
+    user_org_id = int(context["tenant_id"])
+    if user_role == Role.ADMIN or (user_role == Role.ORG_OWNER and user_org_id == org_id):
+        return context
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Requires org_owner for this organization or admin"
+    )
 
 
 # Convenience dependencies (used in route decorators)
@@ -228,7 +231,6 @@ class DocumentIn(BaseModel):
 
     title: str = Field(..., min_length=1, max_length=200)
     content: str = Field(..., min_length=1, max_length=100_000)
-    tenant_id: str = Field(..., min_length=1, max_length=100)
 
 
 class DocumentResponse(BaseModel):
@@ -484,9 +486,10 @@ def create_organization(req: OrganizationCreateRequest) -> dict[str, object]:
     description="Create a user in an organization. Admin can create in any org; org_owner only in their own org.",
     dependencies=[Depends(require_org_owner_or_admin_any)]
 )
-def create_user(req: UserCreateRequest, _: dict = Depends(require_org_owner_or_admin(1))) -> dict[str, object]:
+def create_user(req: UserCreateRequest, context: dict = Depends(get_authenticated_context)) -> dict[str, object]:
     """Create a user and associate them with an organization."""
-    # The dependency factory validates org ownership (admin any, org_owner own org)
+    if os.getenv("USE_MOCK_TENANT", "false").lower() != "true":
+        _check_org_owner_or_admin(context, req.organization_id)
     db = SessionLocal()
     try:
         user = models.User(
@@ -617,23 +620,17 @@ def me(context: dict = Depends(get_authenticated_context)) -> dict[str, object]:
     description="Store a source document in the knowledge base. Requires authentication.",
     dependencies=[Depends(require_any_authenticated)]
 )
-def create_document(doc: DocumentIn) -> dict[str, object]:
+def create_document(doc: DocumentIn, context: dict = Depends(get_authenticated_context)) -> dict[str, object]:
     """Store a source document and return its generated identifier."""
     db = SessionLocal()
-
-    use_mock_tenant = os.getenv("USE_MOCK_TENANT", "false").lower() == "true"
-    if use_mock_tenant:
-        tenant_id = os.getenv("MOCK_TENANT_ID")
-        if not tenant_id:
-            raise RuntimeError("MOCK_TENANT_ID must be set")
-    else:
-        tenant_id = doc.tenant_id
+    tenant_id = str(context["tenant_id"])
 
     try:
         new_doc = models.Document(title=doc.title, content=doc.content, tenant_id=tenant_id)
         db.add(new_doc)
         db.commit()
         db.refresh(new_doc)
+        bump_corpus_version(tenant_id)
         return {"id": new_doc.id, "title": new_doc.title, "status": "stored"}
     finally:
         db.close()
@@ -647,11 +644,11 @@ def create_document(doc: DocumentIn) -> dict[str, object]:
     description="List all source documents for the current tenant. Requires authentication.",
     dependencies=[Depends(require_any_authenticated)]
 )
-def list_documents() -> list[dict[str, object]]:
+def list_documents(context: dict = Depends(get_authenticated_context)) -> list[dict[str, object]]:
     """Return all stored source documents."""
     db = SessionLocal()
     try:
-        tenant_id = get_current_tenant_id()
+        tenant_id = str(context["tenant_id"])
         docs = (
             db.query(models.Document)
             .filter(models.Document.tenant_id == tenant_id)
@@ -725,12 +722,15 @@ def retrieve_chunks(
     return chunks, query_embedding
 
 
-def process_heavy_document(doc_id: int) -> None:
+def process_heavy_document(doc_id: int, tenant_id: str) -> None:
     """Chunk and embed a stored document in a background task."""
     db = SessionLocal()
     doc = None
     try:
-        doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+        doc = db.query(models.Document).filter(
+            models.Document.id == doc_id,
+            models.Document.tenant_id == tenant_id,
+        ).first()
         if not doc:
             return
 
@@ -749,13 +749,16 @@ def process_heavy_document(doc_id: int) -> None:
                 )
             )
 
-        db.commit()
         doc.status = "completed"
         db.commit()
+        bump_corpus_version(tenant_id)
     except Exception as exc:
         db.rollback()
         if doc is None:
-            doc = db.query(models.Document).filter(models.Document.id == doc_id).first()
+            doc = db.query(models.Document).filter(
+                models.Document.id == doc_id,
+                models.Document.tenant_id == tenant_id,
+            ).first()
         if doc:
             doc.status = "failed"
             db.commit()
@@ -772,11 +775,15 @@ def process_heavy_document(doc_id: int) -> None:
     description="Queue document chunking and embedding as a background task. Requires authentication.",
     dependencies=[Depends(require_any_authenticated)]
 )
-def trigger_process(doc_id: int, background_tasks: BackgroundTasks) -> dict[str, object]:
+def trigger_process(
+    doc_id: int,
+    background_tasks: BackgroundTasks,
+    context: dict = Depends(get_authenticated_context),
+) -> dict[str, object]:
     """Queue document processing and return before embedding work begins."""
     db = SessionLocal()
     try:
-        tenant_id = get_current_tenant_id()
+        tenant_id = str(context["tenant_id"])
         doc = (
             db.query(models.Document)
             .filter(
@@ -795,7 +802,7 @@ def trigger_process(doc_id: int, background_tasks: BackgroundTasks) -> dict[str,
 
         doc.status = "processing"
         db.commit()
-        background_tasks.add_task(process_heavy_document, doc_id)
+        background_tasks.add_task(process_heavy_document, doc_id, tenant_id)
         return {
             "status": "processing",
             "doc_id": doc_id,
@@ -813,11 +820,11 @@ def trigger_process(doc_id: int, background_tasks: BackgroundTasks) -> dict[str,
     description="Check the status of a document's background processing (pending/processing/completed/failed). Requires authentication.",
     dependencies=[Depends(require_any_authenticated)]
 )
-def get_document_status(doc_id: int) -> dict[str, object]:
+def get_document_status(doc_id: int, context: dict = Depends(get_authenticated_context)) -> dict[str, object]:
     """Return the current background processing status for a document."""
     db = SessionLocal()
     try:
-        tenant_id = get_current_tenant_id()
+        tenant_id = str(context["tenant_id"])
         doc = (
             db.query(models.Document)
             .filter(
@@ -841,11 +848,14 @@ def get_document_status(doc_id: int) -> dict[str, object]:
     description="Combine dense vector (pgvector) and sparse keyword (PostgreSQL full-text) retrieval. Requires authentication.",
     dependencies=[Depends(require_any_authenticated)]
 )
-def search_documents(req: SearchQuery) -> list[dict[str, object]]:
+def search_documents(
+    req: SearchQuery,
+    context: dict = Depends(get_authenticated_context),
+) -> list[dict[str, object]]:
     """Combine dense vector and sparse keyword retrieval for a query."""
     db = SessionLocal()
     try:
-        tenant_id = get_current_tenant_id()
+        tenant_id = str(context["tenant_id"])
         chunks, _ = retrieve_chunks(db, req.query, tenant_id, req.top_k)
         return chunks[: req.top_k]
     finally:
@@ -864,12 +874,13 @@ class AskQuery(BaseModel):
     description="Retrieve context, check semantic cache, optionally use JEV guard, generate structured answer with citations. Requires authentication.",
     dependencies=[Depends(require_any_authenticated)]
 )
-def ask_question(req: AskQuery) -> RAGResponse:
+def ask_question(req: AskQuery, context: dict = Depends(get_authenticated_context)) -> RAGResponse:
     """Retrieve, rerank, and generate a grounded answer from relevant chunks."""
     db = SessionLocal()
     try:
         query_embedding = get_embedding(req.query)
-        tenant_id = get_current_tenant_id()
+        tenant_id = str(context["tenant_id"])
+        corpus_version = get_corpus_version(tenant_id)
         cached_response = get_cached_response(tenant_id, query_embedding)
         if cached_response:
             return cached_response
@@ -901,7 +912,13 @@ def ask_question(req: AskQuery) -> RAGResponse:
         # --- SENIOR FIX: Force the correct IDs from the database ---
         # Don't rely on the LLM to remember IDs. We inject the exact ones we retrieved.
         llm_response.source_document_ids = list(set(c["document_id"] for c in chunks))
-        cache_response(tenant_id, query_embedding, llm_response)
+        if corpus_version is not None and get_corpus_version(tenant_id) == corpus_version:
+            cache_response(
+                tenant_id,
+                query_embedding,
+                llm_response,
+                corpus_version=corpus_version,
+            )
 
         return llm_response
 

@@ -59,6 +59,28 @@ def load_api_without_external_services():
             self.name = name
             self.slug = slug
 
+    class FakeDocument:
+        id = FakeColumn("id")
+        tenant_id = FakeColumn("tenant_id")
+
+        def __init__(self, title=None, content=None, tenant_id=None):
+            self.id = None
+            self.title = title
+            self.content = content
+            self.tenant_id = tenant_id
+            self.status = "pending"
+
+    class FakeDocumentChunk:
+        def __init__(self, document_id=None, chunk_index=None, chunk_text=None,
+                     embedding=None, tenant_id=None, search_vector=None):
+            self.id = None
+            self.document_id = document_id
+            self.chunk_index = chunk_index
+            self.chunk_text = chunk_text
+            self.embedding = embedding
+            self.tenant_id = tenant_id
+            self.search_vector = search_vector
+
     class FakeUser:
         email = FakeColumn("email")
         token = FakeColumn("token")
@@ -95,27 +117,21 @@ def load_api_without_external_services():
             return self
 
         def first(self):
-            if self.model is FakeUser:
-                for predicate in self._filters:
-                    if isinstance(predicate, tuple):
-                        left, right = predicate
-                        left_name = getattr(left, "name", None)
-                        if left_name == "email" or left == "email":
-                            for user in self.session.users:
-                                if user.email == right:
-                                    return user
-                return None
-            if self.model is FakeAPIToken:
-                for predicate in self._filters:
-                    if isinstance(predicate, tuple):
-                        left, right = predicate
-                        left_name = getattr(left, "name", None)
-                        if left_name == "token" or left == "token":
-                            for token in self.session.tokens:
-                                if token.token == right:
-                                    return token
-                return None
-            return None
+            return next(iter(self.all()), None)
+
+        def all(self):
+            records = self.session.records(self.model)
+            return [record for record in records if self._matches(record)]
+
+        def _matches(self, record):
+            for predicate in self._filters:
+                if not isinstance(predicate, tuple):
+                    continue
+                column, expected = predicate
+                name = getattr(column, "name", column)
+                if getattr(record, name, None) != expected:
+                    return False
+            return True
 
     class FakeSession:
         """In-memory session used by offline tests."""
@@ -124,6 +140,17 @@ def load_api_without_external_services():
             self.organizations = []
             self.users = []
             self.tokens = []
+            self.documents = []
+            self.chunks = []
+
+        def records(self, model):
+            return {
+                FakeOrganization: self.organizations,
+                FakeUser: self.users,
+                FakeAPIToken: self.tokens,
+                FakeDocument: self.documents,
+                FakeDocumentChunk: self.chunks,
+            }.get(model, [])
 
         def query(self, model):
             return FakeQuery(self, model)
@@ -135,17 +162,16 @@ def load_api_without_external_services():
                 self.users.append(obj)
             elif isinstance(obj, FakeAPIToken):
                 self.tokens.append(obj)
+            elif isinstance(obj, FakeDocument):
+                self.documents.append(obj)
+            elif isinstance(obj, FakeDocumentChunk):
+                self.chunks.append(obj)
 
         def commit(self):
-            for item in self.organizations:
-                if item.id is None:
-                    item.id = len(self.organizations)
-            for item in self.users:
-                if item.id is None:
-                    item.id = len(self.users)
-            for item in self.tokens:
-                if item.id is None:
-                    item.id = len(self.tokens)
+            for records in (self.organizations, self.users, self.tokens, self.documents, self.chunks):
+                for item in records:
+                    if item.id is None:
+                        item.id = len(records)
 
         def refresh(self, obj):
             if isinstance(obj, FakeOrganization):
@@ -157,6 +183,9 @@ def load_api_without_external_services():
             elif isinstance(obj, FakeAPIToken):
                 if obj.id is None:
                     obj.id = len(self.tokens)
+            elif isinstance(obj, FakeDocument):
+                if obj.id is None:
+                    obj.id = len(self.documents)
 
         def close(self):
             return None
@@ -175,6 +204,8 @@ def load_api_without_external_services():
     fake_models.Organization = FakeOrganization
     fake_models.User = FakeUser
     fake_models.APIToken = FakeAPIToken
+    fake_models.Document = FakeDocument
+    fake_models.DocumentChunk = FakeDocumentChunk
     fake_llm = types.ModuleType("llm")
     fake_llm.RAGResponse = FakeRAGResponse
     fake_llm.generate_answer = lambda query, context_chunks: FakeRAGResponse()
@@ -183,6 +214,8 @@ def load_api_without_external_services():
     fake_semantic_cache = types.ModuleType("semantic_cache")
     fake_semantic_cache.cache_response = lambda tenant_id, query_vector, response: None
     fake_semantic_cache.get_cached_response = lambda tenant_id, query_vector: None
+    fake_semantic_cache.bump_corpus_version = lambda tenant_id: None
+    fake_semantic_cache.get_corpus_version = lambda tenant_id: 0
 
     fake_structlog = types.ModuleType("structlog")
     fake_structlog.configure = lambda *args, **kwargs: None
@@ -342,13 +375,38 @@ def test_process_trigger_queues_work_and_reports_processing():
     app_module.models.Document = FakeDocument
     app_module.SessionLocal = FakeSession
 
-    response = app_module.trigger_process(42, background_tasks)
+    tenant_context = {"tenant_id": "1", "user_id": 1, "role": "admin"}
+    response = app_module.trigger_process(42, background_tasks, tenant_context)
 
     assert response["status"] == "processing"
     assert response["doc_id"] == 42
     assert background_tasks.tasks[0].func is app_module.process_heavy_document
     assert document.status == "processing"
-    assert app_module.get_document_status(42) == {"status": "processing"}
+    assert app_module.get_document_status(42, tenant_context) == {"status": "processing"}
+
+
+def test_document_processing_bumps_tenant_corpus_version(monkeypatch):
+    """A successful embedding write invalidates the processed tenant's cache."""
+    app_module = load_api_without_external_services()
+    session = app_module.SessionLocal()
+    document = app_module.models.Document(
+        title="Source",
+        content="processed content",
+        tenant_id="1",
+    )
+    session.add(document)
+    session.commit()
+    version_bumps = []
+    monkeypatch.setattr(app_module, "chunk_text", lambda content: [content])
+    monkeypatch.setattr(app_module, "get_embedding", lambda content: [0.0])
+    monkeypatch.setattr(app_module, "bump_corpus_version", version_bumps.append)
+
+    app_module.process_heavy_document(document.id, "1")
+
+    assert document.status == "completed"
+    assert len(session.chunks) == 1
+    assert session.chunks[0].tenant_id == "1"
+    assert version_bumps == ["1"]
 
 
 def test_admin_can_create_organization_and_issue_token():
@@ -411,3 +469,164 @@ def test_protected_route_requires_valid_bearer_token():
     assert response.json()["tenant_id"] == "1"
     assert response.json()["user_id"] == 1
     assert response.json()["role"] == "admin"
+
+
+def add_test_token(app_module, token_value, organization_id, role="member"):
+    """Add an authenticated tenant token to the API's in-memory database."""
+    session = app_module.SessionLocal()
+    organization = app_module.models.Organization(
+        name=f"Organization {organization_id}",
+        slug=f"organization-{organization_id}",
+    )
+    session.add(organization)
+    user = app_module.models.User(
+        email=f"user-{token_value}@example.com",
+        password_hash="hashed::secret",
+        organization_id=organization_id,
+        role=role,
+    )
+    session.add(user)
+    session.commit()
+    token = app_module.models.APIToken(
+        token=token_value,
+        user_id=user.id,
+        organization_id=organization_id,
+        role=role,
+    )
+    session.add(token)
+    session.commit()
+    return {"Authorization": f"Bearer {token_value}"}
+
+
+def test_documents_and_search_are_isolated_between_authenticated_tenants():
+    """A body-supplied tenant is ignored, and other tenants cannot list or access it."""
+    app_module = load_api_without_external_services()
+    client = TestClient(app_module.app)
+    tenant_a = add_test_token(app_module, "tenant-a-token", 1)
+    tenant_b = add_test_token(app_module, "tenant-b-token", 2)
+
+    created = client.post(
+        "/documents",
+        json={"title": "A private doc", "content": "tenant A source", "tenant_id": "2"},
+        headers=tenant_a,
+    )
+
+    assert created.status_code == 200
+    document_id = created.json()["id"]
+    assert app_module.SessionLocal().documents[0].tenant_id == "1"
+    assert [doc["id"] for doc in client.get("/documents", headers=tenant_a).json()] == [document_id]
+    assert client.get("/documents", headers=tenant_b).json() == []
+
+    app_module.retrieve_chunks = lambda db, query, tenant_id, limit, query_embedding=None: (
+        ([{"text": "tenant A source", "document_id": document_id, "similarity_score": 1.0}]
+         if tenant_id == "1" else []),
+        [],
+    )
+    search = client.post("/search", json={"query": "private"}, headers=tenant_b)
+    assert search.status_code == 200
+    assert search.json() == []
+
+    status_response = client.get(f"/documents/{document_id}/status", headers=tenant_b)
+    process_response = client.post(f"/documents/{document_id}/process", headers=tenant_b)
+    assert status_response.status_code == 404
+    assert process_response.status_code == 404
+
+
+def test_ask_cache_is_tenant_isolated_and_document_creation_invalidates(monkeypatch):
+    """Identical questions stay tenant-scoped and a corpus change expires old answers."""
+    app_module = load_api_without_external_services()
+    client = TestClient(app_module.app)
+    tenant_a = add_test_token(app_module, "tenant-a-token", 1)
+    tenant_b = add_test_token(app_module, "tenant-b-token", 2)
+    versions = {"1": 0, "2": 0}
+    cached_answers = {}
+    corpus_answers = {"1": "A before update", "2": "B answer"}
+
+    app_module.get_embedding = lambda text: [1.0, 0.0]
+    app_module.USE_JEV = False
+    app_module.retrieve_chunks = lambda db, query, tenant_id, limit, query_embedding=None: (
+        [{"text": corpus_answers[tenant_id], "document_id": 1, "similarity_score": 1.0}],
+        [1.0, 0.0],
+    )
+    app_module.rerank_chunks = lambda query, chunks: chunks
+    app_module.generate_answer = lambda query, chunks: app_module.RAGResponse(
+        answer=chunks[0]["text"], is_hallucination=False
+    )
+    app_module.get_cached_response = lambda tenant_id, vector: cached_answers.get(
+        (tenant_id, versions[tenant_id])
+    )
+    app_module.get_corpus_version = lambda tenant_id: versions[tenant_id]
+    app_module.cache_response = lambda tenant_id, vector, response, corpus_version=None: cached_answers.__setitem__(
+        (tenant_id, versions[tenant_id]), response
+    )
+    app_module.bump_corpus_version = lambda tenant_id: versions.__setitem__(
+        tenant_id, versions[tenant_id] + 1
+    )
+
+    answer_a = client.post("/ask", json={"query": "same question"}, headers=tenant_a)
+    answer_b = client.post("/ask", json={"query": "same question"}, headers=tenant_b)
+    assert answer_a.json()["answer"] == "A before update"
+    assert answer_b.json()["answer"] == "B answer"
+
+    corpus_answers["1"] = "A after update"
+    added = client.post(
+        "/documents",
+        json={"title": "Updated source", "content": "new tenant A source"},
+        headers=tenant_a,
+    )
+    assert added.status_code == 200
+
+    updated_answer = client.post("/ask", json={"query": "same question"}, headers=tenant_a)
+    assert updated_answer.json()["answer"] == "A after update"
+
+
+def test_ask_does_not_cache_answer_when_corpus_changes_during_generation(monkeypatch):
+    """An in-flight stale answer must not be written under the updated version."""
+    app_module = load_api_without_external_services()
+    client = TestClient(app_module.app)
+    tenant_a = add_test_token(app_module, "tenant-a-token", 1)
+    version = {"value": 0}
+    cached_writes = []
+
+    app_module.get_embedding = lambda text: [1.0, 0.0]
+    app_module.USE_JEV = False
+    app_module.get_corpus_version = lambda tenant_id: version["value"]
+    app_module.get_cached_response = lambda tenant_id, vector: None
+    app_module.retrieve_chunks = lambda db, query, tenant_id, limit, query_embedding=None: (
+        [{"text": "old corpus", "document_id": 1, "similarity_score": 1.0}],
+        [1.0, 0.0],
+    )
+    app_module.rerank_chunks = lambda query, chunks: chunks
+
+    def generate_during_update(query, chunks):
+        version["value"] += 1
+        return app_module.RAGResponse(answer="stale", is_hallucination=False)
+
+    app_module.generate_answer = generate_during_update
+    app_module.cache_response = lambda *args, **kwargs: cached_writes.append((args, kwargs))
+
+    response = client.post("/ask", json={"query": "same question"}, headers=tenant_a)
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == "stale"
+    assert cached_writes == []
+
+
+def test_org_owner_cannot_create_user_in_another_org_but_admin_can():
+    """User creation checks the requested organization rather than a hardcoded ID."""
+    app_module = load_api_without_external_services()
+    client = TestClient(app_module.app)
+    owner = add_test_token(app_module, "org-two-owner", 2, "org_owner")
+    admin = {"Authorization": "Bearer admin_test_token"}
+    payload = {
+        "email": "new-user@example.com",
+        "password": "secret123",
+        "organization_id": 1,
+        "role": "member",
+    }
+
+    forbidden = client.post("/admin/users", json=payload, headers=owner)
+    created = client.post("/admin/users", json=payload, headers=admin)
+    assert forbidden.status_code == 403
+    assert created.status_code == 200
+    assert created.json()["organization_id"] == 1

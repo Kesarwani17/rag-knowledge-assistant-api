@@ -16,15 +16,20 @@ class FakeRedis:
 
     def __init__(self):
         self.values = {}
+        self.counters = {}
 
     def scan_iter(self, match):
         return (key for key in self.values if fnmatch(key, match))
 
     def get(self, key):
-        return self.values.get(key)
+        return self.counters.get(key, self.values.get(key))
 
     def set(self, key, value, ex):
         self.values[key] = value
+
+    def incr(self, key):
+        self.counters[key] = self.counters.get(key, 0) + 1
+        return self.counters[key]
 
 
 def test_cache_returns_response_above_similarity_threshold(monkeypatch):
@@ -63,6 +68,44 @@ def test_cache_does_not_cross_tenants(monkeypatch):
     semantic_cache.cache_response("tenant-a", [1.0, 0.0], response)
 
     assert semantic_cache.get_cached_response("tenant-b", [1.0, 0.0]) is None
+
+
+def test_corpus_version_bump_invalidates_cached_responses(monkeypatch):
+    """A changed tenant corpus must no longer reuse its earlier answer."""
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(semantic_cache, "redis_client", fake_redis)
+    response = RAGResponse(answer="stale", is_hallucination=False)
+
+    semantic_cache.cache_response("tenant-a", [1.0, 0.0], response)
+    semantic_cache.bump_corpus_version("tenant-a")
+
+    assert semantic_cache.get_cached_response("tenant-a", [1.0, 0.0]) is None
+    assert semantic_cache.get_cached_response("tenant-b", [1.0, 0.0]) is None
+
+
+def test_cache_response_uses_captured_corpus_version(monkeypatch):
+    """A response generated before an update stays in the old namespace."""
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(semantic_cache, "redis_client", fake_redis)
+    response = RAGResponse(answer="old", is_hallucination=False)
+
+    semantic_cache.cache_response("tenant-a", [1.0, 0.0], response, corpus_version=0)
+    semantic_cache.bump_corpus_version("tenant-a")
+
+    assert semantic_cache.get_cached_response("tenant-a", [1.0, 0.0]) is None
+
+
+def test_corpus_version_bump_logs_and_continues_when_redis_is_down(monkeypatch, caplog):
+    """Redis outages must not make document writes fail."""
+    class UnavailableRedis:
+        def incr(self, key):
+            raise semantic_cache.redis.RedisError("connection unavailable")
+
+    monkeypatch.setattr(semantic_cache, "redis_client", UnavailableRedis())
+
+    semantic_cache.bump_corpus_version("tenant-a")
+
+    assert "semantic_cache_version_bump_failed" in caplog.text
 
 
 def test_cosine_similarity_rejects_mismatched_vectors():
