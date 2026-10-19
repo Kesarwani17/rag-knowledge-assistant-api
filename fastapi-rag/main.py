@@ -15,7 +15,7 @@ import structlog
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from dotenv import load_dotenv
 from redis.exceptions import RedisError
 from sqlalchemy import desc, func, select, text
@@ -376,11 +376,23 @@ class OrganizationResponse(BaseModel):
     slug: str
 
 
-class UserCreateRequest(BaseModel):
+class BcryptPasswordRequest(BaseModel):
+    """Request base with bcrypt-compatible password validation."""
+
+    password: str = Field(..., min_length=6, max_length=72)
+
+    @field_validator("password")
+    @classmethod
+    def validate_bcrypt_input_length(cls, password: str) -> str:
+        if len(password.encode("utf-8")) > 72:
+            raise ValueError("Password must be at most 72 UTF-8 bytes")
+        return password
+
+
+class UserCreateRequest(BcryptPasswordRequest):
     """Admin request to create a user in an organization."""
 
     email: str = Field(..., min_length=3, max_length=255)
-    password: str = Field(..., min_length=6, max_length=200)
     organization_id: int = Field(..., ge=1)
     role: Role = Role.MEMBER
 
@@ -394,11 +406,10 @@ class UserResponse(BaseModel):
     role: str
 
 
-class TokenCreateRequest(BaseModel):
+class TokenCreateRequest(BcryptPasswordRequest):
     """Admin request to issue a bearer token."""
 
     email: str = Field(..., min_length=3, max_length=255)
-    password: str = Field(..., min_length=6, max_length=200)
     organization_id: int = Field(..., ge=1)
 
 

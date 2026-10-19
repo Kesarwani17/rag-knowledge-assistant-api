@@ -9,6 +9,7 @@ from pathlib import Path
 
 from fastapi import BackgroundTasks
 from fastapi.testclient import TestClient
+from passlib.hash import bcrypt
 from pydantic import BaseModel
 
 PROJECT_DIR = Path(__file__).parents[1] / "fastapi-rag"
@@ -291,6 +292,8 @@ def load_api_without_external_services():
             "reranker",
             "semantic_cache",
             "structlog",
+            "passlib",
+            "passlib.hash",
             "main",
         )
     }
@@ -330,6 +333,45 @@ def test_create_document_requires_fields():
     headers = {"Authorization": "Bearer admin_test_token"}
     response = TestClient(app_module.app).post("/documents", json={}, headers=headers)
     assert response.status_code == 422
+
+
+def test_hash_password_bcrypt_round_trips():
+    """Password hashes produced by the API verify with the configured bcrypt backend."""
+    app_module = load_api_without_external_services()
+    password_hash = app_module._hash_password("x")
+
+    assert bcrypt.verify("x", password_hash)
+    assert not bcrypt.verify("different", password_hash)
+
+
+def test_passwords_over_bcrypt_byte_limit_return_422():
+    """Password endpoints reject values that exceed bcrypt's 72-byte input limit."""
+    app_module = load_api_without_external_services()
+    client = TestClient(app_module.app)
+    password = "é" * 37
+    headers = {"Authorization": "Bearer admin_test_token"}
+
+    user_response = client.post(
+        "/admin/users",
+        json={
+            "email": "long-password@example.com",
+            "password": password,
+            "organization_id": 1,
+            "role": "member",
+        },
+        headers=headers,
+    )
+    token_response = client.post(
+        "/admin/tokens",
+        json={
+            "email": "admin@test.com",
+            "password": password,
+            "organization_id": 1,
+        },
+    )
+
+    assert user_response.status_code == 422
+    assert token_response.status_code == 422
 
 
 def test_create_document_rejects_oversized_content():
